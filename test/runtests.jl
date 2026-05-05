@@ -1,4 +1,4 @@
-using Test, LinearAlgebra, Random, Printf, JuBLAS
+using BenchmarkTools, Test, LinearAlgebra, Random, Printf, JuBLAS
 
 Random.seed!(0)
 
@@ -140,15 +140,11 @@ function _bench(label::AbstractString, ::Type{T}, n::Int, kernels) where {T}
     BLAS.set_num_threads(1)
     A = randn(T, n, n); B = randn(T, n, n); C = zeros(T, n, n)
 
-    # warmup (also forces @generated body emission for each shape)
-    for (_, k) in kernels; gemm!(C, A, B; kernel=k); end
-    mul!(C, A, B)
-
-    t_blas = @elapsed for _ in 1:5; mul!(C, A, B); end
+    t_blas = @belapsed mul!($C, $A, $B)
     gflops_blas = 2 * n^3 * 5 / t_blas / 1e9
 
     for (name, k) in kernels
-        t = @elapsed for _ in 1:5; gemm!(C, A, B; kernel=k); end
+        t = @belapsed gemm!($C, $A, $B; kernel=$k)
         gflops = 2 * n^3 * 5 / t / 1e9
         @printf("[%dx%d %s] %-28s: %6.1f GFLOPS   (OpenBLAS %6.1f GFLOPS, ratio %.2fx)\n",
                 n, n, label, name, gflops, gflops_blas, t / t_blas)

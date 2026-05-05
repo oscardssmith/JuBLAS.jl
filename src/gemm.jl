@@ -51,6 +51,70 @@ end
         @inbounds VecElement(muladd(a[i].value, b[i].value, c[i].value))
     end
 
+# Masked vector load/store via @llvm.masked.{load,store}. Used in the edge
+# writeback path so a partial MR×NR tile turns into one masked `vmovups{k}`
+# per accumulator vector instead of MR×NR scalar conditionals. On AVX-512
+# this lowers to `vmovups zmm{k}` (non-faulting on masked-out lanes); on
+# AVX2 to `vmaskmovps`/`vmaskmovpd` (also non-faulting).
+@generated function _vmaskedload(::Type{Vec{W,T}}, p::Ptr{T}, mask_bits::UInt) where {W,T}
+    bits  = sizeof(T) * 8
+    elt   = bits == 64 ? "double" : (bits == 32 ? "float" : error("unsupported eltype"))
+    vty   = "<$W x $elt>"
+    mvty  = "<$W x i1>"
+    align = sizeof(T)
+    fn    = "llvm.masked.load.v$(W)f$(bits).p0"
+    ir = """
+        declare $vty @$fn(ptr, i32, $mvty, $vty)
+
+        define $vty @entry(ptr %p, i64 %mb) #0 {
+        top:
+            %mt = trunc i64 %mb to i$W
+            %m  = bitcast i$W %mt to $mvty
+            %r  = call $vty @$fn(ptr %p, i32 $align, $mvty %m, $vty zeroinitializer)
+            ret $vty %r
+        }
+
+        attributes #0 = { alwaysinline }
+        """
+    quote
+        Base.llvmcall(($ir, "entry"), Vec{$W,$T},
+                      Tuple{Ptr{$T}, UInt}, p, mask_bits)
+    end
+end
+
+@generated function _vmaskedstore!(p::Ptr{T}, v::Vec{W,T}, mask_bits::UInt) where {W,T}
+    bits  = sizeof(T) * 8
+    elt   = bits == 64 ? "double" : (bits == 32 ? "float" : error("unsupported eltype"))
+    vty   = "<$W x $elt>"
+    mvty  = "<$W x i1>"
+    align = sizeof(T)
+    fn    = "llvm.masked.store.v$(W)f$(bits).p0"
+    ir = """
+        declare void @$fn($vty, ptr, i32, $mvty)
+
+        define void @entry(ptr %p, $vty %v, i64 %mb) #0 {
+        top:
+            %mt = trunc i64 %mb to i$W
+            %m  = bitcast i$W %mt to $mvty
+            call void @$fn($vty %v, ptr %p, i32 $align, $mvty %m)
+            ret void
+        }
+
+        attributes #0 = { alwaysinline }
+        """
+    quote
+        Base.llvmcall(($ir, "entry"), Cvoid,
+                      Tuple{Ptr{$T}, Vec{$W,$T}, UInt}, p, v, mask_bits)
+    end
+end
+
+# Build a W-bit mask whose low `lanes` bits are set. `lanes` is clamped to
+# [0, W]. Used to mask the row-direction edge of the MR×NR writeback tile.
+@inline function _row_mask(lanes::Int, ::Val{W}) where {W}
+    n = max(0, min(W, lanes))
+    n >= W ? (UInt(1) << W) - UInt(1) : (UInt(1) << n) - UInt(1)
+end
+
 # ─── Kernel selection ──────────────────────────────────────────────────────
 
 abstract type AbstractKernel end
@@ -178,44 +242,85 @@ end
 
 # ─── Packing ──────────────────────────────────────────────────────────────
 
-function _pack_A!(Apack::Vector{T}, A::AbstractMatrix{T},
-                  ic::Int, pc::Int, mc::Int, kc::Int, ::Val{MR}) where {T,MR}
-    z = zero(T)
-    npanels = cld(mc, MR)
-    @inbounds for p in 0:npanels-1
-        rs   = p * MR
-        rmax = min(MR, mc - rs)
-        for k in 0:kc-1
-            base = p * MR * kc + k * MR
-            for i in 0:rmax-1
-                Apack[base + i + 1] = A[ic + rs + i, pc + k]
-            end
-            for i in rmax:MR-1
-                Apack[base + i + 1] = z
+# `@generated` with explicit `Vec{MR,T}` load/store on the fast path. This
+# bypasses LLVM's cost-model preference for ymm-versioning + scalar tails:
+# we hand it a single `<MR × T>` value, which lowers to one (or `MR/W`)
+# zmm-width move on AVX-512 targets, no memcheck, no tail.
+# Slow path: edge panel with partial copy + zero fill.
+@generated function _pack_A!(Apack::Vector{T}, A::AbstractMatrix{T},
+                              ic::Int, pc::Int, mc::Int, kc::Int,
+                              ::Val{MR}) where {T,MR}
+    sz = sizeof(T)
+    quote
+        $(Expr(:meta, :inline))
+        z = zero($T)
+        npanels = cld(mc, $MR)
+        GC.@preserve Apack A begin
+            pAp = pointer(Apack)
+            pA  = pointer(A)
+            ldA = stride(A, 2)
+            @inbounds for p in 0:npanels-1
+                rs   = p * $MR
+                rmax = min($MR, mc - rs)
+                base_panel = p * $MR * kc
+                if rmax == $MR
+                    for k in 0:kc-1
+                        src_off = ((ic + rs - 1) + (pc + k - 1) * ldA) * $sz
+                        dst_off = (base_panel + k * $MR) * $sz
+                        _vstore!(pAp + dst_off, _vload(Vec{$MR,$T}, pA + src_off))
+                    end
+                else
+                    for k in 0:kc-1
+                        base = base_panel + k * $MR
+                        for i in 1:rmax
+                            Apack[base + i] = A[ic + rs + i - 1, pc + k]
+                        end
+                        for i in rmax+1:$MR
+                            Apack[base + i] = z
+                        end
+                    end
+                end
             end
         end
+        return Apack
     end
-    return Apack
 end
 
-function _pack_B!(Bpack::Vector{T}, B::AbstractMatrix{T},
-                  pc::Int, jc::Int, kc::Int, nc::Int, ::Val{NR}) where {T,NR}
-    z = zero(T)
-    npanels = cld(nc, NR)
-    @inbounds for p in 0:npanels-1
-        cs   = p * NR
-        cmax = min(NR, nc - cs)
-        for k in 0:kc-1
-            base = p * NR * kc + k * NR
-            for j in 0:cmax-1
-                Bpack[base + j + 1] = B[pc + k, jc + cs + j]
-            end
-            for j in cmax:NR-1
-                Bpack[base + j + 1] = z
+# Same fast/slow split as `_pack_A!`. The inner copy here is stride-`ldB`
+# (varying column of column-major B), so LLVM can't fold it into one
+# vector load — but unrolling avoids versioning + memcheck overhead and
+# lets the loads/stores schedule cleanly.
+@generated function _pack_B!(Bpack::Vector{T}, B::AbstractMatrix{T},
+                              pc::Int, jc::Int, kc::Int, nc::Int,
+                              ::Val{NR}) where {T,NR}
+    fast_copy = [:( Bpack[base + $j] = B[pc + k, jc + cs + $(j-1)] ) for j in 1:NR]
+    quote
+        $(Expr(:meta, :inline))
+        z = zero($T)
+        npanels = cld(nc, $NR)
+        @inbounds for p in 0:npanels-1
+            cs   = p * $NR
+            cmax = min($NR, nc - cs)
+            base_panel = p * $NR * kc
+            if cmax == $NR
+                for k in 0:kc-1
+                    base = base_panel + k * $NR
+                    $(fast_copy...)
+                end
+            else
+                for k in 0:kc-1
+                    base = base_panel + k * $NR
+                    for j in 1:cmax
+                        Bpack[base + j] = B[pc + k, jc + cs + j - 1]
+                    end
+                    for j in cmax+1:$NR
+                        Bpack[base + j] = z
+                    end
+                end
             end
         end
+        return Bpack
     end
-    return Bpack
 end
 
 # ─── Macrokernel ──────────────────────────────────────────────────────────
@@ -352,16 +457,22 @@ end
         end)
     end
 
-    # Scalar edge writeback
+    # Masked vector edge writeback. For each (r,j) we conditionally store the
+    # accumulator with a row-mask derived from `mr_`; columns past `nr_` are
+    # skipped at compile time (the `j <= nr_` check has `j` as a literal).
     write_edge = Expr[]
-    for j in 1:NR, r in 1:rows, ii in 1:W
-        c  = Symbol("c_", r, "_", j)
-        gi = (r - 1) * W + ii          # 1-based row in the MR×NR tile
+    for j in 1:NR, r in 1:rows
+        c    = Symbol("c_", r, "_", j)
+        roff = (r - 1) * W
         push!(write_edge, quote
-            if $gi <= mr_ && $j <= nr_
-                cv = $c
-                C[ci + $(gi-1), cj + $(j-1)] =
-                    muladd(α, cv[$ii].value, C[ci + $(gi-1), cj + $(j-1)])
+            if $j <= nr_
+                let off  = ((cj + $(j-1) - 1) * ldc + (ci + $roff - 1)) * $sz,
+                    mask = _row_mask(mr_ - $roff, Val($W))
+                    if mask != UInt(0)
+                        cur = _vmaskedload($Vty, pC + off, mask)
+                        _vmaskedstore!(pC + off, _vfma(αv, $c, cur), mask)
+                    end
+                end
             end
         end)
     end
@@ -379,8 +490,8 @@ end
 
             pC  = pointer(C)
             ldc = stride(C, 2)
+            αv  = _vbcast(α, Val($W))
             if $full
-                αv = _vbcast(α, Val($W))
                 $(write_full...)
             else
                 @inbounds begin $(write_edge...) end

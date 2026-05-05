@@ -7,16 +7,17 @@
 #
 # Available kernels (all parametric):
 #     ScalarKernel{MR,NR}        — fully scalar, works for any T
-#     AVX512Kernel{MR,NR,T}      — explicit zmm SIMD; T ∈ {Float32, Float64};
-#                                  MR must be a multiple of the SIMD lane count
-#                                  (W=8 for Float64, W=16 for Float32);
-#                                  requires StridedMatrix C, falls back to
+#     SIMDKernel{W,MR,NR,T}      — explicit-width SIMD; W is the lane count
+#                                  (LLVM lowers `<W x T>` to zmm/ymm/xmm/...).
+#                                  MR must be a multiple of W. Requires
+#                                  StridedMatrix C, falls back to
 #                                  ScalarKernel{MR,NR} otherwise.
 #
-# Both kernels' bodies are emitted by `@generated`, so `(MR,NR)` are
+# Both kernels' bodies are emitted by `@generated`, so all dimensions are
 # fully unrolled by LLVM with no runtime indirection. Try a different shape
 # by constructing a different kernel:
-#     gemm!(C, A, B; kernel=AVX512Kernel{16,14,Float64}())
+#     gemm!(C, A, B; kernel=SIMDKernel{8,16,14,Float64}())   # AVX-512 16×14
+#     gemm!(C, A, B; kernel=SIMDKernel{4, 8, 6,Float64}())   # AVX2 8×6
 
 using Base.Cartesian
 
@@ -26,36 +27,29 @@ const Vec{W,T} = NTuple{W, VecElement{T}}
 
 @inline _vbcast(x::T, ::Val{W}) where {T,W} = ntuple(_ -> VecElement(x), Val(W))
 @inline _vzero(::Type{Vec{W,T}}) where {W,T} = _vbcast(zero(T), Val(W))
-@inline _vload(::Type{Vec{W,T}}, p::Ptr{T}) where {W,T} = unsafe_load(Ptr{Vec{W,T}}(p))
-@inline _vstore!(p::Ptr{T}, v::Vec{W,T}) where {W,T} = unsafe_store!(Ptr{Vec{W,T}}(p), v)
 
-# Vector FMA via llvmcall (full-module form). Emits `vfmadd231pd zmm,…` (Float64)
-# or `vfmadd231ps zmm,…` (Float32) when the target supports AVX-512.
-@generated function _vfma(a::Vec{W,T}, b::Vec{W,T}, c::Vec{W,T}) where {W,T}
-    bits = sizeof(T) * 8
-    elt  = bits == 64 ? "double" : (bits == 32 ? "float" : error("unsupported eltype"))
-    vty  = "<$W x $elt>"
-    fn   = "llvm.fma.v$(W)f$(bits)"
-    ir   = """
-        declare $vty @$fn($vty, $vty, $vty)
-
-        define $vty @entry($vty, $vty, $vty) #0 {
-        top:
-            %r = call $vty @$fn($vty %0, $vty %1, $vty %2)
-            ret $vty %r
-        }
-
-        attributes #0 = { alwaysinline }
-        """
-    quote
-        Base.llvmcall(($ir, "entry"), Vec{$W,$T},
-                      Tuple{Vec{$W,$T}, Vec{$W,$T}, Vec{$W,$T}}, a, b, c)
-    end
+# Vector load/store via a single Ptr{Vec{W,T}} cast. The kernel body extracts
+# raw pointers (and the C column stride) once outside the hot loop and passes
+# byte offsets in — that lets LLVM hoist the base computations and keeps the
+# inner loop down to one `vmovupd zmm`/`vfmadd231pd` sequence per iteration.
+@inline function _vload(::Type{Vec{W,T}}, p::Ptr{T}) where {W,T}
+    unsafe_load(Ptr{Vec{W,T}}(p))
 end
 
-# AVX-512 lane count for a supported type. Float64→8, Float32→16.
-_avx512_W(::Type{Float64}) = 8
-_avx512_W(::Type{Float32}) = 16
+@inline function _vstore!(p::Ptr{T}, v::Vec{W,T}) where {W,T}
+    unsafe_store!(Ptr{Vec{W,T}}(p), v)
+    return nothing
+end
+
+# Vector FMA, pure Julia. `NTuple{W, VecElement{T}}` is already a `<W x T>`
+# at the LLVM level; doing W independent scalar muladds and reassembling via
+# `ntuple(_, Val(W))` (fully unrolled) gives LLVM's SLP vectorizer a clean
+# pattern to fold back into a single vector FMA. On AVX-512 targets we expect
+# `vfmadd231pd zmm,…` (Float64) or `vfmadd231ps zmm,…` (Float32).
+@inline _vfma(a::Vec{W,T}, b::Vec{W,T}, c::Vec{W,T}) where {W,T} =
+    ntuple(Val(W)) do i
+        @inbounds VecElement(muladd(a[i].value, b[i].value, c[i].value))
+    end
 
 # ─── Kernel selection ──────────────────────────────────────────────────────
 
@@ -71,29 +65,31 @@ kernels when C isn't a `StridedMatrix`.
 struct ScalarKernel{MR,NR} <: AbstractKernel end
 
 """
-    AVX512Kernel{MR,NR,T}()
+    SIMDKernel{W,MR,NR,T}()
 
-Explicit AVX-512 microkernel with NR vector accumulators per row group
-(MR/W groups, where W is the lane count for `T`). Body emitted by
-`@generated`. Requires `StridedMatrix{T}` for the SIMD path; falls back
-to `ScalarKernel{MR,NR}` for other matrix types.
+Explicit-width SIMD microkernel. `W` is the SIMD lane count: LLVM lowers
+`<W x T>` to whatever width the target supports (zmm for W=8 Float64 on
+AVX-512, ymm for W=4 Float64 on AVX2, xmm for W=2 Float64 on SSE2, etc.).
+`MR` must be a multiple of `W`; the accumulator is laid out as `MR/W` row
+groups × `NR` columns of vector registers. Requires `StridedMatrix{T}` for
+the SIMD path; falls back to `ScalarKernel{MR,NR}` otherwise.
 
-Examples:
-    AVX512Kernel{8, 24, Float64}()   # MKL-style 8×24 (default)
-    AVX512Kernel{16,14, Float64}()   # BLIS skx-style 16×14
-    AVX512Kernel{8, 14, Float64}()
+Examples (Float64):
+    SIMDKernel{8,  8, 24, Float64}()   # AVX-512, MKL-style 8×24 (default)
+    SIMDKernel{8, 16, 14, Float64}()   # AVX-512, BLIS skx-style 16×14
+    SIMDKernel{4,  4,  6, Float64}()   # AVX2 ymm, 4×6
+    SIMDKernel{4,  8,  6, Float64}()   # AVX2 ymm, 8×6 (2 ymm per col)
+    SIMDKernel{2,  2,  4, Float64}()   # SSE2 xmm, 2×4
 """
-struct AVX512Kernel{MR,NR,T} <: AbstractKernel end
+struct SIMDKernel{W,MR,NR,T} <: AbstractKernel end
 
-# Backwards-compatible alias.
-const AVX512F64Kernel = AVX512Kernel{8,24,Float64}
+mr(::ScalarKernel{MR,NR}) where {MR,NR}             = MR
+nr(::ScalarKernel{MR,NR}) where {MR,NR}             = NR
+mr(::SIMDKernel{W,MR,NR,T}) where {W,MR,NR,T}       = MR
+nr(::SIMDKernel{W,MR,NR,T}) where {W,MR,NR,T}       = NR
 
-mr(::ScalarKernel{MR,NR}) where {MR,NR}        = MR
-nr(::ScalarKernel{MR,NR}) where {MR,NR}        = NR
-mr(::AVX512Kernel{MR,NR,T}) where {MR,NR,T}    = MR
-nr(::AVX512Kernel{MR,NR,T}) where {MR,NR,T}    = NR
-
-default_kernel(::Type{Float64}) = AVX512Kernel{8,24,Float64}()
+default_kernel(::Type{Float64}) = SIMDKernel{8,   8, 24, Float64}()
+default_kernel(::Type{Float32}) = SIMDKernel{16, 16, 24, Float32}()
 default_kernel(::Type{T}) where {T} = ScalarKernel{8,6}()
 
 # ─── Block sizes (per-kernel traits) ──────────────────────────────────────
@@ -112,8 +108,16 @@ mc_block(k::AbstractKernel) = cld(72, mr(k)) * mr(k)   # round up to multiple of
 kc_block(::AbstractKernel)  = 256
 nc_block(::AbstractKernel)  = 4080
 
-# AVX-512 SIMD: cap KC so NR × KC × sizeof(T) ≤ ~28 KiB.
-function kc_block(::AVX512Kernel{MR,NR,T}) where {MR,NR,T}
+# SIMD kernels: scale MC so the A micropanel byte budget (~MC × KC × sizeof(T))
+# stays L2-resident. Reference point: Float64 MR=8 → MC=72 (BLIS dgemm skx default).
+# For Float32 the same byte budget gives MC=144; matches BLIS sgemm skx default.
+function mc_block(::SIMDKernel{W,MR,NR,T}) where {W,MR,NR,T}
+    target_mc = (72 * 8) ÷ sizeof(T)
+    return cld(target_mc, MR) * MR
+end
+
+# SIMD kernels: cap KC so the B micropanel (NR × KC × sizeof(T)) fits in L1.
+function kc_block(::SIMDKernel{W,MR,NR,T}) where {W,MR,NR,T}
     raw = (28 * 1024) ÷ (NR * sizeof(T))
     return clamp(raw - raw % 8, 64, 256)
 end
@@ -291,25 +295,24 @@ end
     end
 end
 
-# ─── Microkernel: AVX512Kernel (parametric, JIT-unrolled SIMD) ───────────
+# ─── Microkernel: SIMDKernel (parametric on W, MR, NR, T; JIT-unrolled) ──
 
 # Non-strided fallback: route through the scalar kernel.
-@inline function _kernel!(::AVX512Kernel{MR,NR,T}, C::AbstractMatrix{T},
+@inline function _kernel!(::SIMDKernel{W,MR,NR,T}, C::AbstractMatrix{T},
                           Apack::Vector{T}, Bpack::Vector{T},
                           ao::Int, bo::Int, kc::Int, ci::Int, cj::Int,
-                          mr_::Int, nr_::Int, α::T, v::Val) where {MR,NR,T}
+                          mr_::Int, nr_::Int, α::T, v::Val) where {W,MR,NR,T}
     return _kernel!(ScalarKernel{MR,NR}(), C, Apack, Bpack, ao, bo, kc,
                     ci, cj, mr_, nr_, α, v)
 end
 
-@generated function _kernel!(::AVX512Kernel{MR,NR,T}, C::StridedMatrix{T},
+@generated function _kernel!(::SIMDKernel{W,MR,NR,T}, C::StridedMatrix{T},
                               Apack::Vector{T}, Bpack::Vector{T},
                               ao::Int, bo::Int, kc::Int, ci::Int, cj::Int,
                               mr_::Int, nr_::Int, α::T,
-                              ::Val{full}) where {MR,NR,T,full}
-    W = _avx512_W(T)
+                              ::Val{full}) where {W,MR,NR,T,full}
     MR % W == 0 ||
-        throw(ArgumentError("AVX512Kernel: MR=$MR must be a multiple of W=$W for $T"))
+        throw(ArgumentError("SIMDKernel: MR=$MR must be a multiple of W=$W"))
     rows = MR ÷ W
     sz   = sizeof(T)
     Vty  = :(Vec{$W,$T})
@@ -320,7 +323,8 @@ end
         push!(init, :( $(Symbol("c_", r, "_", j)) = _vzero($Vty) ))
     end
 
-    # Inner k-loop body
+    # Inner k-loop body. `pA`/`pB` are extracted once at the top of the kernel
+    # so the loop sees byte-offset arithmetic only.
     inner = Expr[]
     for r in 1:rows
         a   = Symbol("a_", r)
@@ -336,10 +340,10 @@ end
         end
     end
 
-    # Vector writeback (full tile)
+    # Vector writeback (full tile). `pC`/`ldc` extracted once outside.
     write_full = Expr[]
     for j in 1:NR, r in 1:rows
-        c   = Symbol("c_", r, "_", j)
+        c    = Symbol("c_", r, "_", j)
         roff = (r - 1) * W
         push!(write_full, quote
             let off = ((cj + $(j-1) - 1) * ldc + (ci + $roff - 1)) * $sz

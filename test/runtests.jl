@@ -82,8 +82,7 @@ Random.seed!(0)
     end
 end
 
-@testset "Kernel selection (multiple dispatch)" begin
-    # Every kernel shape must produce the same result on Float64.
+@testset "Kernel selection (Float64)" begin
     M, N, K = 73, 65, 200   # exercises edge tiles in MR, NR, K
     A = randn(M, K); B = randn(K, N)
     ref = A * B
@@ -91,10 +90,12 @@ end
     kernels = (
         ScalarKernel{8,6}(),
         ScalarKernel{8,24}(),
-        AVX512Kernel{8,6,Float64}(),
-        AVX512Kernel{8,14,Float64}(),
-        AVX512Kernel{8,24,Float64}(),
-        AVX512Kernel{16,14,Float64}(),
+        SIMDKernel{8, 8, 6,Float64}(),
+        SIMDKernel{8, 8,14,Float64}(),
+        SIMDKernel{8, 8,24,Float64}(),
+        SIMDKernel{8,16,14,Float64}(),
+        SIMDKernel{4, 4, 6,Float64}(),    # AVX2 ymm
+        SIMDKernel{4, 8, 6,Float64}(),    # AVX2 ymm, 2 ymm/col
     )
     for kernel in kernels
         C = zeros(M, N)
@@ -105,24 +106,39 @@ end
         @test C ≈ -1.5 .* ref .+ 0.5 .* C0
     end
 
-    # Sanity: default for Float64 is the 8×24 AVX-512 kernel.
-    @test default_kernel(Float64) === AVX512Kernel{8,24,Float64}()
-    @test default_kernel(Float64) isa AVX512F64Kernel   # const alias still works
-    @test default_kernel(Float32) isa ScalarKernel
+    @test default_kernel(Float64) === SIMDKernel{8,8,24,Float64}()
 end
 
-@testset "gemm! performance (single-threaded vs OpenBLAS)" begin
-    BLAS.set_num_threads(1)
-    n = 512
-    A = randn(n, n); B = randn(n, n); C = zeros(n, n)
+@testset "Kernel selection (Float32)" begin
+    # Sizes chosen to hit edges for the wider Float32 SIMD shapes (W=16).
+    M, N, K = 81, 73, 200
+    A = randn(Float32, M, K); B = randn(Float32, K, N)
+    ref = A * B
 
-    kernels = [
-        ("Scalar 8x6",   ScalarKernel{8,6}()),
-        ("AVX512 8x6",   AVX512Kernel{8,6, Float64}()),
-        ("AVX512 8x14",  AVX512Kernel{8,14,Float64}()),
-        ("AVX512 8x24",  AVX512Kernel{8,24,Float64}()),
-        ("AVX512 16x14", AVX512Kernel{16,14,Float64}()),
-    ]
+    kernels = (
+        ScalarKernel{16,6}(),
+        SIMDKernel{16,16, 6,Float32}(),    # AVX-512 zmm, 16×6
+        SIMDKernel{16,16,14,Float32}(),    # AVX-512 zmm, 16×14
+        SIMDKernel{16,16,24,Float32}(),    # AVX-512 zmm, 16×24 (default)
+        SIMDKernel{16,32,14,Float32}(),    # AVX-512 zmm, 32×14 (2 zmm/col)
+        SIMDKernel{ 8, 8, 6,Float32}(),    # AVX2 ymm, 8×6
+        SIMDKernel{ 8,16, 6,Float32}(),    # AVX2 ymm, 16×6 (2 ymm/col)
+    )
+    for kernel in kernels
+        C = zeros(Float32, M, N)
+        gemm!(C, A, B; kernel=kernel)
+        @test C ≈ ref rtol=1f-4
+        C0 = randn(Float32, M, N); C = copy(C0)
+        gemm!(C, A, B, -1.5f0, 0.5f0; kernel=kernel)
+        @test C ≈ -1.5f0 .* ref .+ 0.5f0 .* C0 rtol=1f-4
+    end
+
+    @test default_kernel(Float32) === SIMDKernel{16,16,24,Float32}()
+end
+
+function _bench(label::AbstractString, ::Type{T}, n::Int, kernels) where {T}
+    BLAS.set_num_threads(1)
+    A = randn(T, n, n); B = randn(T, n, n); C = zeros(T, n, n)
 
     # warmup (also forces @generated body emission for each shape)
     for (_, k) in kernels; gemm!(C, A, B; kernel=k); end
@@ -134,8 +150,35 @@ end
     for (name, k) in kernels
         t = @elapsed for _ in 1:5; gemm!(C, A, B; kernel=k); end
         gflops = 2 * n^3 * 5 / t / 1e9
-        @printf("[%dx%d F64] %-13s: %6.1f GFLOPS   (OpenBLAS %6.1f GFLOPS, ratio %.2fx)\n",
-                n, n, name, gflops, gflops_blas, t / t_blas)
+        @printf("[%dx%d %s] %-28s: %6.1f GFLOPS   (OpenBLAS %6.1f GFLOPS, ratio %.2fx)\n",
+                n, n, label, name, gflops, gflops_blas, t / t_blas)
     end
+end
+
+@testset "gemm! Float64 performance (single-threaded vs OpenBLAS)" begin
+    kernels = [
+        ("Scalar 8x6",            ScalarKernel{8,6}()),
+        ("SIMD W=4 (AVX2)   4x6", SIMDKernel{4, 4, 6,Float64}()),
+        ("SIMD W=4 (AVX2)   8x6", SIMDKernel{4, 8, 6,Float64}()),
+        ("SIMD W=8 (AVX512) 8x6", SIMDKernel{8, 8, 6,Float64}()),
+        ("SIMD W=8 (AVX512) 8x14",SIMDKernel{8, 8,14,Float64}()),
+        ("SIMD W=8 (AVX512) 8x24",SIMDKernel{8, 8,24,Float64}()),
+        ("SIMD W=8 (AVX512)16x14",SIMDKernel{8,16,14,Float64}()),
+    ]
+    _bench("F64", Float64, 512, kernels)
+    # not asserted — informational
+end
+
+@testset "gemm! Float32 performance (single-threaded vs OpenBLAS)" begin
+    kernels = [
+        ("Scalar 16x6",             ScalarKernel{16,6}()),
+        ("SIMD W=8  (AVX2)    8x6", SIMDKernel{ 8, 8, 6,Float32}()),
+        ("SIMD W=8  (AVX2)   16x6", SIMDKernel{ 8,16, 6,Float32}()),
+        ("SIMD W=16 (AVX512) 16x6", SIMDKernel{16,16, 6,Float32}()),
+        ("SIMD W=16 (AVX512) 16x14",SIMDKernel{16,16,14,Float32}()),
+        ("SIMD W=16 (AVX512) 16x24",SIMDKernel{16,16,24,Float32}()),
+        ("SIMD W=16 (AVX512) 32x14",SIMDKernel{16,32,14,Float32}()),
+    ]
+    _bench("F32", Float32, 512, kernels)
     # not asserted — informational
 end

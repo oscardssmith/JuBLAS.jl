@@ -7,6 +7,9 @@ using LinearAlgebra: Transpose, Adjoint, Symmetric, Hermitian
 include("utils.jl")
 include("gemm.jl")
 include("gemm_complex.jl")
+include("blas1.jl")
+include("blas2.jl")
+include("blas_interface.jl")
 
 # `Symmetric` / `Hermitian` inputs: materialize the wrapped matrix to a
 # regular `Matrix` and re-enter `gemm!`; the eltype-dispatched real or

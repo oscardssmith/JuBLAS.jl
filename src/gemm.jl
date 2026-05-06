@@ -63,11 +63,22 @@ function gemm_workspace(::Type{T}, kernel::AbstractKernel) where {T}
     return (Apack, Bpack)
 end
 
+
+# Public kwarg surface. The trim path doesn't go through here — juliac
+# entry points in `blas_interface.jl` call `_gemm!` directly with a
+# concretely-typed kernel — so this stays as a thin forwarder.
 function gemm!(C::AbstractMatrix{T}, A::AbstractMatrix{T}, B::AbstractMatrix{T},
                α = true, β = false;
                kernel::AbstractKernel = default_kernel(T, size(C,1), size(C,2), size(A,2)),
                Apack::Union{Vector{T},Nothing} = nothing,
                Bpack::Union{Vector{T},Nothing} = nothing) where {T<:Real}
+    _gemm!(C, A, B, α, β, kernel, Apack, Bpack)
+end
+
+function _gemm!(C::AbstractMatrix{T}, A::AbstractMatrix{T}, B::AbstractMatrix{T},
+                α, β, kernel::AbstractKernel,
+                Apack::Union{Vector{T},Nothing},
+                Bpack::Union{Vector{T},Nothing}) where {T<:Real}
     M, N = size(C)
     size(A, 1) == M           || throw(DimensionMismatch("size(A,1) ≠ size(C,1)"))
     size(B, 2) == N           || throw(DimensionMismatch("size(B,2) ≠ size(C,2)"))

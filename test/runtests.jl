@@ -1,6 +1,8 @@
 using BenchmarkTools, Test, LinearAlgebra, Random, Printf, JuBLAS
+using Libdl
 
 include("transpose_check.jl")
+include("test_libjublas.jl")
 
 Random.seed!(0)
 

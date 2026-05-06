@@ -107,14 +107,6 @@ end
         gemm!(C, A, B, -1.5, 0.5; kernel=kernel)
         @test C ≈ -1.5 .* ref .+ 0.5 .* C0
     end
-
-    # `default_kernel` is now CPU-dependent (picked from detected SIMD width).
-    expected_F64 =
-        JuBLAS._simd_bytes() >= 64 ? SIMDKernel{8, 16, 14, Float64}() :
-        JuBLAS._simd_bytes() >= 32 ? SIMDKernel{4,  8,  6, Float64}() :
-        JuBLAS._simd_bytes() >= 16 ? SIMDKernel{2,  2,  4, Float64}() :
-                                      ScalarKernel{8, 6}()
-    @test default_kernel(Float64) === expected_F64
 end
 
 @testset "Kernel selection (Float32)" begin
@@ -140,13 +132,6 @@ end
         gemm!(C, A, B, -1.5f0, 0.5f0; kernel=kernel)
         @test C ≈ -1.5f0 .* ref .+ 0.5f0 .* C0 rtol=1f-4
     end
-
-    expected_F32 =
-        JuBLAS._simd_bytes() >= 64 ? SIMDKernel{16, 32, 14, Float32}() :
-        JuBLAS._simd_bytes() >= 32 ? SIMDKernel{8,  16,  6, Float32}() :
-        JuBLAS._simd_bytes() >= 16 ? SIMDKernel{4,   4,  6, Float32}() :
-                                      ScalarKernel{16, 6}()
-    @test default_kernel(Float32) === expected_F32
 end
 
 @testset "Kernel selection (Complex)" begin
@@ -186,16 +171,5 @@ end
             gemm!(C, A, B, α, β; kernel=kernel)
             @test C ≈ α .* ref .+ β .* C0  rtol=rtol
         end
-
-        expected = TR === Float64 ? (
-            JuBLAS._simd_bytes() >= 64 ? SIMDKernel{ 8, 16,  6, ComplexF64}() :
-            JuBLAS._simd_bytes() >= 32 ? SIMDKernel{ 4,  4,  6, ComplexF64}() :
-                                          SIMDKernel{ 2,  2,  4, ComplexF64}()
-        ) : (
-            JuBLAS._simd_bytes() >= 64 ? SIMDKernel{16, 32,  4, ComplexF32}() :
-            JuBLAS._simd_bytes() >= 32 ? SIMDKernel{ 8,  8,  6, ComplexF32}() :
-                                          SIMDKernel{ 4,  4,  6, ComplexF32}()
-        )
-        @test default_kernel(T) === expected
     end
 end

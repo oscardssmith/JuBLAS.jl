@@ -19,15 +19,15 @@
 # and the smaller NR (`*sizeof(Complex{TR})` budget for L1d) lets KC grow to
 # its 512 clamp, halving pack overhead. AVX2/SSE2 fallbacks stay rows=1
 # because their 16-register file can't host the rows=2 accumulator tile.
-function default_kernel(::Type{ComplexF64})
+function default_kernel(::Type{ComplexF64}, M::Int, N::Int, K::Int)
     sb = _simd_bytes()
-    sb >= 64 ? SIMDKernel{8, 16,  6, ComplexF64}() :   # AVX-512 rows=2
+    sb >= 64 ? SIMDKernel{8,  8,  8, ComplexF64}() :   # AVX-512 rows=1
     sb >= 32 ? SIMDKernel{4,  4,  6, ComplexF64}() :   # AVX2 ymm
     SIMDKernel{2,  2,  4, ComplexF64}()                # SSE2 xmm
 end
-function default_kernel(::Type{ComplexF32})
+function default_kernel(::Type{ComplexF32}, M::Int, N::Int, K::Int)
     sb = _simd_bytes()
-    sb >= 64 ? SIMDKernel{16, 32, 4, ComplexF32}() :   # AVX-512 rows=2
+    sb >= 64 ? SIMDKernel{16, 32, 6, ComplexF32}() :   # AVX-512 rows=2
     sb >= 32 ? SIMDKernel{8,   8, 6, ComplexF32}() :   # AVX2 ymm
     SIMDKernel{4,   4, 6, ComplexF32}()                # SSE2 xmm
 end
@@ -381,7 +381,7 @@ end
 
 function gemm!(C::AbstractMatrix{Complex{TR}}, A::AbstractMatrix{Complex{TR}}, B::AbstractMatrix{Complex{TR}},
                α = true, β = false;
-               kernel::SIMDKernel{W,MR,NR,Complex{TR}} = default_kernel(Complex{TR}),
+               kernel::SIMDKernel{W,MR,NR,Complex{TR}} = default_kernel(Complex{TR}, size(C,1), size(C,2), size(A,2)),
                Apack::Union{Vector{TR},Nothing} = nothing,
                Bpack::Union{Vector{TR},Nothing} = nothing) where {W,MR,NR,TR<:Real}
     M, N = size(C)

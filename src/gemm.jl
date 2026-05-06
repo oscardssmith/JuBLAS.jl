@@ -17,15 +17,28 @@ using Base.Cartesian
 # shapes come from the bench sweep — these are the configs that consistently
 # won on Skylake-class hardware.
 
-function default_kernel(::Type{Float64})
+function default_kernel(::Type{Float64}, M::Int, N::Int, K::Int)
     sb = _simd_bytes()
-    sb >= 64 ? SIMDKernel{8, 16, 14, Float64}() :
-    sb >= 32 ? SIMDKernel{4,  8,  6, Float64}() :
-    SIMDKernel{2,  2,  4, Float64}()
+    if sb >= 64
+        # Narrow-N override (Float64 AVX-512 only): when N ≤ 128 the default
+        # NR=14 panel leaves only ~9 column tiles, hurting load balance. NR=8
+        # with MR=24 gives ~16 panels and beat the default by ~3 GFLOPS in the
+        # (512, 128, 512) shape sweep.
+        if N <= 128
+            SIMDKernel{8, 24, 8, Float64}()
+        else
+            SIMDKernel{8, 16, 14, Float64}()
+        end
+    elseif sb >= 32
+        SIMDKernel{4,  8,  6, Float64}()
+    else
+        SIMDKernel{2,  2,  4, Float64}()
+    end
 end
-function default_kernel(::Type{Float32})
+
+function default_kernel(::Type{Float32}, M::Int, N::Int, K::Int)
     sb = _simd_bytes()
-    sb >= 64 ? SIMDKernel{16, 32, 14, Float32}() :
+    sb >= 64 ? SIMDKernel{16, 32, 12, Float32}() :
     sb >= 32 ? SIMDKernel{8,  16,  6, Float32}() :
     SIMDKernel{4,   4,  6, Float32}()
 end
@@ -52,7 +65,7 @@ end
 
 function gemm!(C::AbstractMatrix{T}, A::AbstractMatrix{T}, B::AbstractMatrix{T},
                α = true, β = false;
-               kernel::AbstractKernel = default_kernel(T),
+               kernel::AbstractKernel = default_kernel(T, size(C,1), size(C,2), size(A,2)),
                Apack::Union{Vector{T},Nothing} = nothing,
                Bpack::Union{Vector{T},Nothing} = nothing) where {T<:Real}
     M, N = size(C)

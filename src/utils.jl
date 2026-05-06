@@ -138,7 +138,15 @@ nr(::ScalarKernel{MR,NR})   where {MR,NR}     = NR
 mr(::SIMDKernel{W,MR,NR,T}) where {W,MR,NR,T} = MR
 nr(::SIMDKernel{W,MR,NR,T}) where {W,MR,NR,T} = NR
 
-default_kernel(::Type{T}) where {T} = ScalarKernel{8, 6}()    # generic fallback
+# Shape-aware default. Per-eltype methods can specialize on (M, N, K) —
+# e.g. Float64 AVX-512 switches to a smaller-NR kernel when N is too
+# small for the default NR to tile cleanly. The generic fallback ignores
+# shape and returns the scalar kernel.
+default_kernel(::Type{T}, M::Int, N::Int, K::Int) where {T} = ScalarKernel{8, 6}()
+# 1-arg convenience: no shape hint → call the 4-arg form with `typemax`,
+# which lands in the wide-N branch for any specialized eltype.
+default_kernel(::Type{T}) where {T} =
+    default_kernel(T, typemax(Int), typemax(Int), typemax(Int))
 
 # ─── Block sizes ──────────────────────────────────────────────────────────
 #

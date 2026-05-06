@@ -1,12 +1,16 @@
-using JuBLAS, LinearAlgebra, LinuxPerf, Printf, Random
+using JuBLAS, LinearAlgebra, Printf, Random
 
-# Sweeps `gemm!` perf vs OpenBLAS / MKL across every (opA, opB) ∈
-# {N, T, C}² combo, for any supported eltype. Correctness should be
-# verified separately via `test/transpose_check.jl`.
+# Sweeps `gemm!` perf vs OpenBLAS (and MKL if available) across every
+# (opA, opB) ∈ {N, T, C}² combo, for any supported eltype. Correctness
+# should be verified separately via `test/transpose_check.jl`.
 #
 # Usage:
 #     julia --project=bench bench/transpose_bench.jl [N] [ITERS] [ELT]
 # where ELT ∈ {Float32, Float64, ComplexF32, ComplexF64}.
+#
+# MKL is loaded if present in the active environment but isn't a hard
+# dep — `]add MKL` in the bench env to enable that comparison. Skipped
+# silently otherwise (e.g. on aarch64 / Apple Silicon).
 
 const N     = length(ARGS) >= 1 ? parse(Int, ARGS[1]) : 512
 const ITERS = length(ARGS) >= 2 ? parse(Int, ARGS[2]) : 5000
@@ -46,20 +50,13 @@ const C = zeros(T, N, N)
 const KERNEL = JuBLAS.default_kernel(T)
 const Apack, Bpack = JuBLAS.gemm_workspace(T, KERNEL)
 
-const EVENTS = "(cpu-cycles,instructions,branch-instructions,branch-misses)," *
-               "(L1-dcache-loads,L1-dcache-load-misses)," *
-               "(LLC-loads,LLC-load-misses)"
-
 function bench(label, work)
     GC.gc()
     t0 = time_ns()
-    stats = @pstats EVENTS work()
+    work()
     elapsed = (time_ns() - t0) / 1e9
     gflops = FLOPS_PER_MAC * N^3 * ITERS / elapsed / 1e9
-    @printf("\n=== %s  —  %.2fs  %.1f GFLOPS  (N=%d, iters=%d, T=%s) ===\n",
-            label, elapsed, gflops, N, ITERS, T)
-    show(stdout, MIME"text/plain"(), stats)
-    println()
+    @printf("%-32s  %6.2fs  %7.1f GFLOPS\n", label, elapsed, gflops)
 end
 
 const COMBOS = [(opA, opB) for opA in (:N, :T, :C), opB in (:N, :T, :C)][:]
@@ -75,6 +72,8 @@ let Awarm = randn(T, N, N), Bwarm = randn(T, N, N), Cwarm = zeros(T, N, N)
         mul!(Cwarm, Awarm, Bwarm)
     end
 end
+
+@printf("\n=== gemm! sweep (T=%s, N=%d, iters=%d) ===\n", T, N, ITERS)
 
 for (opA, opB) in COMBOS
     PA, A = make_arg(T, opA, N, N)
@@ -93,15 +92,25 @@ for (opA, opB) in COMBOS
     bench("openblas  op(A)=$opA op(B)=$opB", mul_loop)
 end
 
-@info "switching BLAS backend to MKL"
-using MKL
-BLAS.set_num_threads(1)
-@info "active BLAS: $(BLAS.get_config())"
+# Optional MKL comparison. Soft-load: if the bench env doesn't have MKL
+# (e.g. aarch64), skip silently with a one-line note.
+mkl_loaded = try
+    @eval using MKL
+    true
+catch
+    false
+end
 
-for (opA, opB) in COMBOS
-    PA, A = make_arg(T, opA, N, N)
-    PB, B = make_arg(T, opB, N, N)
-    mul_loop() = (for _ in 1:ITERS; mul!(C, A, B); end)
-    for _ in 1:5; mul!(C, A, B); end
-    bench("mkl       op(A)=$opA op(B)=$opB", mul_loop)
+if mkl_loaded
+    BLAS.set_num_threads(1)
+    @info "switching BLAS backend to MKL: $(BLAS.get_config())"
+    for (opA, opB) in COMBOS
+        PA, A = make_arg(T, opA, N, N)
+        PB, B = make_arg(T, opB, N, N)
+        mul_loop() = (for _ in 1:ITERS; mul!(C, A, B); end)
+        for _ in 1:5; mul!(C, A, B); end
+        bench("mkl       op(A)=$opA op(B)=$opB", mul_loop)
+    end
+else
+    @info "MKL not available — skipping MKL comparison."
 end

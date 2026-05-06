@@ -1,0 +1,12 @@
+[deps]
+JuBLAS = "d8401e69-3990-4c7a-83fd-a8de2d04f897"
+LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
+LinuxPerf = "b4c46c6c-4fb0-484d-a11a-41bc3392d094"
+MKL = "33e6dc65-8f57-5167-99aa-e5a354878fb2"
+Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
+Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
+
+[compat]
+LinuxPerf = "0.3"
+MKL = "0.7, 0.8"
+julia = "1.10"

@@ -147,45 +147,53 @@ end
     @test default_kernel(Float32) === expected_F32
 end
 
-function _bench(label::AbstractString, ::Type{T}, n::Int, kernels) where {T}
-    BLAS.set_num_threads(1)
-    A = randn(T, n, n); B = randn(T, n, n); C = zeros(T, n, n)
+@testset "Kernel selection (Complex)" begin
+    # Sizes chosen so partial-tile and partial-row-group writebacks fire:
+    # - M=33: with MR=8 → mr_=1 on the last ir block; with MR=16 (rows=2) → mr_=1
+    #   (only first row-group active, second row-group has mr_-W ≤ 0).
+    # - N=25: with NR=12 → nr_=1 on the last jr block.
+    # - K=50: doesn't affect edge dispatch but stresses the kc accumulation.
+    M, N, K = 33, 25, 50
 
-    t_blas = @belapsed mul!($C, $A, $B)
-    gflops_blas = 2 * n^3 * 5 / t_blas / 1e9
+    for T in (ComplexF64, ComplexF32)
+        TR = real(T)
+        A = randn(T, M, K); B = randn(T, K, N)
+        ref = A * B
+        rtol = TR === Float32 ? 1f-4 : 1e-10
 
-    for (name, k) in kernels
-        t = @belapsed gemm!($C, $A, $B; kernel=$k)
-        gflops = 2 * n^3 * 5 / t / 1e9
-        @printf("[%dx%d %s] %-28s: %6.1f GFLOPS   (OpenBLAS %6.1f GFLOPS, ratio %.2fx)\n",
-                n, n, label, name, gflops, gflops_blas, t / t_blas)
+        kernels = T === ComplexF64 ? (
+            SIMDKernel{8,  8, 12, ComplexF64}(),    # AVX-512 zmm, 8×12
+            SIMDKernel{8, 16, 12, ComplexF64}(),    # AVX-512 zmm, rows=2
+            SIMDKernel{4,  4,  6, ComplexF64}(),    # AVX2 ymm
+            SIMDKernel{4,  8,  6, ComplexF64}(),    # AVX2 ymm, rows=2
+        ) : (
+            SIMDKernel{16, 16, 12, ComplexF32}(),   # AVX-512 zmm
+            SIMDKernel{16, 32, 12, ComplexF32}(),   # AVX-512 zmm, rows=2
+            SIMDKernel{ 8,  8,  6, ComplexF32}(),   # AVX2 ymm
+            SIMDKernel{ 8, 16,  6, ComplexF32}(),   # AVX2 ymm, rows=2
+        )
+
+        for kernel in kernels
+            C = zeros(T, M, N)
+            gemm!(C, A, B; kernel=kernel)
+            @test C ≈ ref rtol=rtol
+
+            C0 = randn(T, M, N); C = copy(C0)
+            α = TR(1.5) - TR(0.3)*im
+            β = TR(0.7) + TR(0.2)*im
+            gemm!(C, A, B, α, β; kernel=kernel)
+            @test C ≈ α .* ref .+ β .* C0  rtol=rtol
+        end
+
+        expected = TR === Float64 ? (
+            JuBLAS._simd_bytes() >= 64 ? SIMDKernel{ 8, 16,  6, ComplexF64}() :
+            JuBLAS._simd_bytes() >= 32 ? SIMDKernel{ 4,  4,  6, ComplexF64}() :
+                                          SIMDKernel{ 2,  2,  4, ComplexF64}()
+        ) : (
+            JuBLAS._simd_bytes() >= 64 ? SIMDKernel{16, 32,  4, ComplexF32}() :
+            JuBLAS._simd_bytes() >= 32 ? SIMDKernel{ 8,  8,  6, ComplexF32}() :
+                                          SIMDKernel{ 4,  4,  6, ComplexF32}()
+        )
+        @test default_kernel(T) === expected
     end
-end
-
-@testset "gemm! Float64 performance (single-threaded vs OpenBLAS)" begin
-    kernels = [
-        ("Scalar 8x6",            ScalarKernel{8,6}()),
-        ("SIMD W=4 (AVX2)   4x6", SIMDKernel{4, 4, 6,Float64}()),
-        ("SIMD W=4 (AVX2)   8x6", SIMDKernel{4, 8, 6,Float64}()),
-        ("SIMD W=8 (AVX512) 8x6", SIMDKernel{8, 8, 6,Float64}()),
-        ("SIMD W=8 (AVX512) 8x14",SIMDKernel{8, 8,14,Float64}()),
-        ("SIMD W=8 (AVX512) 8x24",SIMDKernel{8, 8,24,Float64}()),
-        ("SIMD W=8 (AVX512)16x14",SIMDKernel{8,16,14,Float64}()),
-    ]
-    _bench("F64", Float64, 512, kernels)
-    # not asserted — informational
-end
-
-@testset "gemm! Float32 performance (single-threaded vs OpenBLAS)" begin
-    kernels = [
-        ("Scalar 16x6",             ScalarKernel{16,6}()),
-        ("SIMD W=8  (AVX2)    8x6", SIMDKernel{ 8, 8, 6,Float32}()),
-        ("SIMD W=8  (AVX2)   16x6", SIMDKernel{ 8,16, 6,Float32}()),
-        ("SIMD W=16 (AVX512) 16x6", SIMDKernel{16,16, 6,Float32}()),
-        ("SIMD W=16 (AVX512) 16x14",SIMDKernel{16,16,14,Float32}()),
-        ("SIMD W=16 (AVX512) 16x24",SIMDKernel{16,16,24,Float32}()),
-        ("SIMD W=16 (AVX512) 32x14",SIMDKernel{16,32,14,Float32}()),
-    ]
-    _bench("F32", Float32, 512, kernels)
-    # not asserted — informational
 end

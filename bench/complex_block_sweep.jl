@@ -1,0 +1,120 @@
+# Sweep MC and KC for the chosen complex kernel shape on this host.
+#
+# IMPORTANT: This bench mirrors `perf_bench_complex.jl`'s persistent-buffer
+# methodology — Apack/Bpack are allocated once per (MC, KC) configuration
+# and reused across all timed iterations. An earlier version of this sweep
+# allocated fresh buffers inside each call, which measured the cold-buffer
+# regime (smaller KC wins because there's less to refetch from L3/RAM each
+# call). Production code uses `gemm_workspace`-allocated persistent
+# buffers, so cold-buffer numbers are misleading. See
+# `~/.claude/.../memory/feedback_bench_persistent_buffers.md` for the
+# incident log.
+#
+# We can't easily override `mc_block`/`kc_block` from outside the package,
+# so the sweep inlines the `gemm!` loop with caller-supplied MC, KC, NC.
+
+using JuBLAS, LinearAlgebra, Printf, Random
+
+const N     = length(ARGS) >= 1 ? parse(Int, ARGS[1]) : 512
+const ITERS = length(ARGS) >= 2 ? parse(Int, ARGS[2]) : 500
+const ELT   = length(ARGS) >= 3 ? Symbol(ARGS[3])     : :ComplexF64
+
+BLAS.set_num_threads(1)
+
+const T  = ELT === :ComplexF32 ? ComplexF32 : ComplexF64
+const TR = T === ComplexF64 ? Float64 : Float32
+
+Random.seed!(0xc0ffee)
+const A = randn(T, N, N)
+const B = randn(T, N, N)
+const C = zeros(T, N, N)
+
+const KERNEL = JuBLAS.default_kernel(T)
+@info "kernel: $(typeof(KERNEL))"
+
+const MR_ = JuBLAS.mr(KERNEL)
+const NR_ = JuBLAS.nr(KERNEL)
+
+# Run one `gemm!` call's worth of work with caller-supplied (MC, KC, NC),
+# using *pre-allocated* `Apack`/`Bpack`. Sized for the bench's largest grid
+# point so the same buffers serve every config.
+function run_gemm!(C, A, B, kernel, MC, KC, NC, αT, Apack, Bpack)
+    M, N = size(C)
+    K = size(A, 2)
+    MR = JuBLAS.mr(kernel); NR = JuBLAS.nr(kernel)
+    JuBLAS._scale!(C, false)
+
+    @inbounds for jc in 1:NC:N
+        nc = min(NC, N - jc + 1)
+        for pc in 1:KC:K
+            kc = min(KC, K - pc + 1)
+            JuBLAS._pack_B!(Bpack, B, pc, jc, kc, nc, Val(NR))
+            for ic in 1:MC:M
+                mc = min(MC, M - ic + 1)
+                JuBLAS._pack_A!(Apack, A, ic, pc, mc, kc, Val(MR))
+                JuBLAS._macrokernel!(kernel, C, Apack, Bpack, ic, jc, mc, nc, kc, αT)
+            end
+        end
+    end
+    return C
+end
+
+# Default block sizes (for reference + buffer sizing).
+const caches = JuBLAS._cache_sizes()
+const KC_DEFAULT = JuBLAS.kc_block(KERNEL, caches)
+const MC_DEFAULT = JuBLAS.mc_block(KERNEL, caches)
+const NC_DEFAULT = JuBLAS.nc_block(KERNEL, caches)
+
+# Sweep grid.
+const MC_GRID = unique(sort([
+    MC_DEFAULT,
+    MR_, MR_ * 2, MR_ * 3, MR_ * 4, MR_ * 6, MR_ * 8, MR_ * 10, MR_ * 12,
+    MR_ * 14, MR_ * 16, MR_ * 20, MR_ * 24, MR_ * 32,
+]))
+
+const KC_GRID = unique(sort([
+    KC_DEFAULT,
+    128, 192, 256, 320, 384, 512,
+]))
+
+# Pre-allocate Apack/Bpack sized for the largest (MC, KC) we'll test, so
+# the same buffer serves every configuration. Sized for complex storage
+# (2 reals per complex element).
+const MC_MAX = maximum(MC_GRID)
+const KC_MAX = maximum(KC_GRID)
+const NC_FOR_BENCH = NC_DEFAULT
+const APACK = Vector{TR}(undef, 2 * cld(MC_MAX, MR_) * MR_ * KC_MAX)
+const BPACK = Vector{TR}(undef, 2 * cld(NC_FOR_BENCH, NR_) * NR_ * KC_MAX)
+
+function bench_blocks(MC, KC, NC)
+    αT = convert(T, true)
+    # Warm up with the *same* persistent buffers we'll time.
+    for _ in 1:5
+        run_gemm!(C, A, B, KERNEL, MC, KC, NC, αT, APACK, BPACK)
+    end
+    GC.gc()
+    t0 = time_ns()
+    for _ in 1:ITERS
+        run_gemm!(C, A, B, KERNEL, MC, KC, NC, αT, APACK, BPACK)
+    end
+    elapsed = (time_ns() - t0) / 1e9
+    gflops = 8 * N^3 * ITERS / elapsed / 1e9
+    return gflops
+end
+
+@printf("\n=== Complex block-size sweep (T=%s, N=%d, iters=%d) ===\n", T, N, ITERS)
+@printf("kernel=%s  defaults: MC=%d, KC=%d, NC=%d\n",
+        typeof(KERNEL), MC_DEFAULT, KC_DEFAULT, NC_DEFAULT)
+@printf("\n%6s  %6s  %8s  %8s\n", "MC", "KC", "GFLOPS", "delta%")
+
+reference = bench_blocks(MC_DEFAULT, KC_DEFAULT, NC_FOR_BENCH)
+@printf("%6d  %6d  %8.1f  %8s  (default)\n", MC_DEFAULT, KC_DEFAULT, reference, "—")
+
+for KC in KC_GRID
+    for MC in MC_GRID
+        (KC == KC_DEFAULT && MC == MC_DEFAULT) && continue
+        gflops = bench_blocks(MC, KC, NC_FOR_BENCH)
+        delta = (gflops - reference) / reference * 100
+        @printf("%6d  %6d  %8.1f  %+7.1f%%\n", MC, KC, gflops, delta)
+    end
+end

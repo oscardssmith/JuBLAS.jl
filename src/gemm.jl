@@ -1,162 +1,34 @@
-# gemm.jl — single-threaded, generic, Goto-style matrix multiply with
-# selectable, JIT-generated microkernels via multiple dispatch + @generated.
+# gemm.jl — single-threaded Goto-style real matrix multiply.
 #
 # Public API:
 #     gemm!(C, A, B, α=true, β=false; kernel=default_kernel(eltype(C)))
-#         C ← α·A·B + β·C   (in place)
+#         C ← α·A·B + β·C   (in place; restricted here to `eltype <: Real`)
 #
-# Available kernels (all parametric):
-#     ScalarKernel{MR,NR}        — fully scalar, works for any T
-#     SIMDKernel{W,MR,NR,T}      — explicit-width SIMD; W is the lane count
-#                                  (LLVM lowers `<W x T>` to zmm/ymm/xmm/...).
-#                                  MR must be a multiple of W. Requires
-#                                  StridedMatrix C, falls back to
-#                                  ScalarKernel{MR,NR} otherwise.
-#
-# Both kernels' bodies are emitted by `@generated`, so all dimensions are
-# fully unrolled by LLVM with no runtime indirection. Try a different shape
-# by constructing a different kernel:
-#     gemm!(C, A, B; kernel=SIMDKernel{8,16,14,Float64}())   # AVX-512 16×14
-#     gemm!(C, A, B; kernel=SIMDKernel{4, 8, 6,Float64}())   # AVX2 8×6
+# Kernel types, default selection, block-size traits, CPU detection, the
+# `prefix_mask` SIMD primitives, and the shared `_scale!` helper all live
+# in `utils.jl`. Complex gemm lives in `gemm_complex.jl`.
 
 using Base.Cartesian
 
-# `prefix_mask`, `vload_prefix`, `vstore_prefix!` come from `utils.jl`
-# (vendored from a pending SIMD.jl PR). Used to mask the row-direction edge
-# of the MR×NR writeback tile.
-
-# ─── Kernel selection ──────────────────────────────────────────────────────
-
-abstract type AbstractKernel end
-
-"""
-    ScalarKernel{MR,NR}()
-
-Scalar microkernel with MR×NR register-tile accumulator, body unrolled by
-`@generated`. Works for any element type. Used as the fallback for SIMD
-kernels when C isn't a `StridedMatrix`.
-"""
-struct ScalarKernel{MR,NR} <: AbstractKernel end
-
-"""
-    SIMDKernel{W,MR,NR,T}()
-
-Explicit-width SIMD microkernel. `W` is the SIMD lane count: LLVM lowers
-`<W x T>` to whatever width the target supports (zmm for W=8 Float64 on
-AVX-512, ymm for W=4 Float64 on AVX2, xmm for W=2 Float64 on SSE2, etc.).
-`MR` must be a multiple of `W`; the accumulator is laid out as `MR/W` row
-groups × `NR` columns of vector registers. Requires `StridedMatrix{T}` for
-the SIMD path; falls back to `ScalarKernel{MR,NR}` otherwise.
-
-Examples (Float64):
-    SIMDKernel{8,  8, 24, Float64}()   # AVX-512, MKL-style 8×24 (default)
-    SIMDKernel{8, 16, 14, Float64}()   # AVX-512, BLIS skx-style 16×14
-    SIMDKernel{4,  4,  6, Float64}()   # AVX2 ymm, 4×6
-    SIMDKernel{4,  8,  6, Float64}()   # AVX2 ymm, 8×6 (2 ymm per col)
-    SIMDKernel{2,  2,  4, Float64}()   # SSE2 xmm, 2×4
-"""
-struct SIMDKernel{W,MR,NR,T} <: AbstractKernel end
-
-mr(::ScalarKernel{MR,NR}) where {MR,NR}             = MR
-nr(::ScalarKernel{MR,NR}) where {MR,NR}             = NR
-mr(::SIMDKernel{W,MR,NR,T}) where {W,MR,NR,T}       = MR
-nr(::SIMDKernel{W,MR,NR,T}) where {W,MR,NR,T}       = NR
-
-# Runtime CPU detection. Each call issues CPUID and parses the result —
-# ~hundreds of cycles, run a handful of times per `gemm!` call, lost in
-# the noise of a millisecond-scale matmul. CpuId is x86-only and may throw
-# on hypervisors that hide cache info; fall back to Skylake-class defaults.
-function _cache_sizes()
-    try
-        cs = CpuId.cachesize()
-        l1 = length(cs) >= 1 && cs[1] > 0 ? Int(cs[1]) : 32 * 1024
-        l2 = length(cs) >= 2 && cs[2] > 0 ? Int(cs[2]) : 1024 * 1024
-        l3 = length(cs) >= 3 && cs[3] > 0 ? Int(cs[3]) : 16 * 1024 * 1024
-        return (l1, l2, l3)
-    catch
-        return (32 * 1024, 1024 * 1024, 16 * 1024 * 1024)
-    end
-end
-_simd_bytes() = try; Int(CpuId.simdbytes()); catch; 0; end
-
+# ─── Default kernel selection ────────────────────────────────────────────
+#
 # Pick the strongest microkernel the host CPU can run. AVX-512 (zmm, 64 B),
-# then AVX2 (ymm, 32 B), then SSE2 (xmm, 16 B), else scalar. The MR×NR shapes
-# come from the bench sweep — these are the configs that consistently won on
-# Skylake-class hardware.
+# then AVX2 (ymm, 32 B), then SSE2 (xmm, 16 B), else scalar. The MR×NR
+# shapes come from the bench sweep — these are the configs that consistently
+# won on Skylake-class hardware.
+
 function default_kernel(::Type{Float64})
     sb = _simd_bytes()
     sb >= 64 ? SIMDKernel{8, 16, 14, Float64}() :
     sb >= 32 ? SIMDKernel{4,  8,  6, Float64}() :
-    sb >= 16 ? SIMDKernel{2,  2,  4, Float64}() :
-               ScalarKernel{8, 6}()
+    SIMDKernel{2,  2,  4, Float64}()
 end
 function default_kernel(::Type{Float32})
     sb = _simd_bytes()
     sb >= 64 ? SIMDKernel{16, 32, 14, Float32}() :
     sb >= 32 ? SIMDKernel{8,  16,  6, Float32}() :
-    sb >= 16 ? SIMDKernel{4,   4,  6, Float32}() :
-               ScalarKernel{16, 6}()
+    SIMDKernel{4,   4,  6, Float32}()
 end
-default_kernel(::Type{T}) where {T} = ScalarKernel{8, 6}()
-
-# ─── Block sizes (per-kernel traits) ──────────────────────────────────────
-#
-# `mc_block`: rows of A panel held in L2. Must be a multiple of MR so the
-#             macrokernel's ir-loop has no edge panels in the common case.
-# `kc_block`: depth of A/B panels. For SIMD kernels we size KC so the B
-#             micropanel (NR × KC × T) lives in L1d (A is streamed).
-# `nc_block`: width of B slab held in L3.
-
-# Each `*_block` method takes a `(L1d, L2, L3)` cache-size tuple. Callers
-# (`gemm!`, `gemm_workspace`) query `_cache_sizes()` once and thread the
-# tuple through, so a single `gemm!` call costs one CpuId trip.
-#
-# ScalarKernel / AbstractKernel fallback: no cache-aware tuning — used only
-# for the non-strided-C path, which isn't perf-critical.
-mc_block(k::AbstractKernel, _caches=_cache_sizes()) = cld(72, mr(k)) * mr(k)
-kc_block(::AbstractKernel,  _caches=_cache_sizes()) = 256
-nc_block(::AbstractKernel,  _caches=_cache_sizes()) = 4080
-
-# SIMDKernel block sizes follow the Goto/BLIS cache hierarchy:
-#
-#   KC: B micropanel (NR × KC × T) is hot in L1d throughout one macrokernel
-#       call (reused across MC/MR ir-iterations). A is *streamed* one
-#       column-of-MR per k-iter, so only a few A cache lines are hot at any
-#       moment — we don't budget the full A microtile against L1d. Take 3/4
-#       of L1d to leave room for the streamed A lines, stack, and writeback.
-#
-#   MC: A panel (MC × KC × T) is hot in L2 across all NR-stride steps of the
-#       jr loop. Budget half of L2, leaving room for the B slab to coexist
-#       (it also funnels through L2 from L3) and for system noise.
-#
-#   NC: B slab (KC × NC × T) is hot in L3 across all MC-stride steps of the
-#       ic loop. Budget half of L3 to share with A and any co-runners.
-#
-# Each block is rounded to be a clean multiple of the relevant register
-# tile dimension so the macrokernel's loops have no edge in the bulk case.
-
-function kc_block(::SIMDKernel{W,MR,NR,T}, caches=_cache_sizes()) where {W,MR,NR,T}
-    l1 = caches[1]
-    budget = (l1 * 3) ÷ 4
-    raw    = budget ÷ (NR * sizeof(T))
-    return clamp(raw - raw % 8, 64, 512)
-end
-
-function mc_block(k::SIMDKernel{W,MR,NR,T}, caches=_cache_sizes()) where {W,MR,NR,T}
-    kc        = kc_block(k, caches)
-    l2        = caches[2]
-    target_mc = max((l2 ÷ 2) ÷ (kc * sizeof(T)), MR)
-    return cld(target_mc, MR) * MR
-end
-
-function nc_block(k::SIMDKernel{W,MR,NR,T}, caches=_cache_sizes()) where {W,MR,NR,T}
-    kc        = kc_block(k, caches)
-    l3        = caches[3]
-    target_nc = max((l3 ÷ 2) ÷ (kc * sizeof(T)), NR)
-    return (target_nc ÷ NR) * NR
-end
-
-# ─── Main entry point ─────────────────────────────────────────────────────
 
 """
     gemm_workspace(::Type{T}, kernel) -> (Apack, Bpack)
@@ -182,7 +54,7 @@ function gemm!(C::AbstractMatrix{T}, A::AbstractMatrix{T}, B::AbstractMatrix{T},
                α = true, β = false;
                kernel::AbstractKernel = default_kernel(T),
                Apack::Union{Vector{T},Nothing} = nothing,
-               Bpack::Union{Vector{T},Nothing} = nothing) where {T}
+               Bpack::Union{Vector{T},Nothing} = nothing) where {T<:Real}
     M, N = size(C)
     size(A, 1) == M           || throw(DimensionMismatch("size(A,1) ≠ size(C,1)"))
     size(B, 2) == N           || throw(DimensionMismatch("size(B,2) ≠ size(C,2)"))
@@ -222,18 +94,6 @@ function gemm!(C::AbstractMatrix{T}, A::AbstractMatrix{T}, B::AbstractMatrix{T},
                 _pack_A!(Apack, A, ic, pc, mc, kc, Val(MR_))
                 _macrokernel!(kernel, C, Apack, Bpack, ic, jc, mc, nc, kc, αT)
             end
-        end
-    end
-    return C
-end
-
-function _scale!(C::AbstractMatrix{T}, β) where {T}
-    if iszero(β)
-        fill!(C, zero(T))
-    elseif !isone(β)
-        βT = convert(T, β)
-        @inbounds @simd for i in eachindex(C)
-            C[i] = βT * C[i]
         end
     end
     return C

@@ -106,7 +106,13 @@ end
         @test C ≈ -1.5 .* ref .+ 0.5 .* C0
     end
 
-    @test default_kernel(Float64) === SIMDKernel{8,8,24,Float64}()
+    # `default_kernel` is now CPU-dependent (picked from detected SIMD width).
+    expected_F64 =
+        JuBLAS._simd_bytes() >= 64 ? SIMDKernel{8, 16, 14, Float64}() :
+        JuBLAS._simd_bytes() >= 32 ? SIMDKernel{4,  8,  6, Float64}() :
+        JuBLAS._simd_bytes() >= 16 ? SIMDKernel{2,  2,  4, Float64}() :
+                                      ScalarKernel{8, 6}()
+    @test default_kernel(Float64) === expected_F64
 end
 
 @testset "Kernel selection (Float32)" begin
@@ -133,7 +139,12 @@ end
         @test C ≈ -1.5f0 .* ref .+ 0.5f0 .* C0 rtol=1f-4
     end
 
-    @test default_kernel(Float32) === SIMDKernel{16,16,24,Float32}()
+    expected_F32 =
+        JuBLAS._simd_bytes() >= 64 ? SIMDKernel{16, 32, 14, Float32}() :
+        JuBLAS._simd_bytes() >= 32 ? SIMDKernel{8,  16,  6, Float32}() :
+        JuBLAS._simd_bytes() >= 16 ? SIMDKernel{4,   4,  6, Float32}() :
+                                      ScalarKernel{16, 6}()
+    @test default_kernel(Float32) === expected_F32
 end
 
 function _bench(label::AbstractString, ::Type{T}, n::Int, kernels) where {T}

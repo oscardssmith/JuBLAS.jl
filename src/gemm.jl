@@ -21,99 +21,9 @@
 
 using Base.Cartesian
 
-# ─── SIMD primitives (parametric on lane count W and scalar type T) ──────
-
-const Vec{W,T} = NTuple{W, VecElement{T}}
-
-@inline _vbcast(x::T, ::Val{W}) where {T,W} = ntuple(_ -> VecElement(x), Val(W))
-@inline _vzero(::Type{Vec{W,T}}) where {W,T} = _vbcast(zero(T), Val(W))
-
-# Vector load/store via a single Ptr{Vec{W,T}} cast. The kernel body extracts
-# raw pointers (and the C column stride) once outside the hot loop and passes
-# byte offsets in — that lets LLVM hoist the base computations and keeps the
-# inner loop down to one `vmovupd zmm`/`vfmadd231pd` sequence per iteration.
-@inline function _vload(::Type{Vec{W,T}}, p::Ptr{T}) where {W,T}
-    unsafe_load(Ptr{Vec{W,T}}(p))
-end
-
-@inline function _vstore!(p::Ptr{T}, v::Vec{W,T}) where {W,T}
-    unsafe_store!(Ptr{Vec{W,T}}(p), v)
-    return nothing
-end
-
-# Vector FMA, pure Julia. `NTuple{W, VecElement{T}}` is already a `<W x T>`
-# at the LLVM level; doing W independent scalar muladds and reassembling via
-# `ntuple(_, Val(W))` (fully unrolled) gives LLVM's SLP vectorizer a clean
-# pattern to fold back into a single vector FMA. On AVX-512 targets we expect
-# `vfmadd231pd zmm,…` (Float64) or `vfmadd231ps zmm,…` (Float32).
-@inline _vfma(a::Vec{W,T}, b::Vec{W,T}, c::Vec{W,T}) where {W,T} =
-    ntuple(Val(W)) do i
-        @inbounds VecElement(muladd(a[i].value, b[i].value, c[i].value))
-    end
-
-# Masked vector load/store via @llvm.masked.{load,store}. Used in the edge
-# writeback path so a partial MR×NR tile turns into one masked `vmovups{k}`
-# per accumulator vector instead of MR×NR scalar conditionals. On AVX-512
-# this lowers to `vmovups zmm{k}` (non-faulting on masked-out lanes); on
-# AVX2 to `vmaskmovps`/`vmaskmovpd` (also non-faulting).
-@generated function _vmaskedload(::Type{Vec{W,T}}, p::Ptr{T}, mask_bits::UInt) where {W,T}
-    bits  = sizeof(T) * 8
-    elt   = bits == 64 ? "double" : (bits == 32 ? "float" : error("unsupported eltype"))
-    vty   = "<$W x $elt>"
-    mvty  = "<$W x i1>"
-    align = sizeof(T)
-    fn    = "llvm.masked.load.v$(W)f$(bits).p0"
-    ir = """
-        declare $vty @$fn(ptr, i32, $mvty, $vty)
-
-        define $vty @entry(ptr %p, i64 %mb) #0 {
-        top:
-            %mt = trunc i64 %mb to i$W
-            %m  = bitcast i$W %mt to $mvty
-            %r  = call $vty @$fn(ptr %p, i32 $align, $mvty %m, $vty zeroinitializer)
-            ret $vty %r
-        }
-
-        attributes #0 = { alwaysinline }
-        """
-    quote
-        Base.llvmcall(($ir, "entry"), Vec{$W,$T},
-                      Tuple{Ptr{$T}, UInt}, p, mask_bits)
-    end
-end
-
-@generated function _vmaskedstore!(p::Ptr{T}, v::Vec{W,T}, mask_bits::UInt) where {W,T}
-    bits  = sizeof(T) * 8
-    elt   = bits == 64 ? "double" : (bits == 32 ? "float" : error("unsupported eltype"))
-    vty   = "<$W x $elt>"
-    mvty  = "<$W x i1>"
-    align = sizeof(T)
-    fn    = "llvm.masked.store.v$(W)f$(bits).p0"
-    ir = """
-        declare void @$fn($vty, ptr, i32, $mvty)
-
-        define void @entry(ptr %p, $vty %v, i64 %mb) #0 {
-        top:
-            %mt = trunc i64 %mb to i$W
-            %m  = bitcast i$W %mt to $mvty
-            call void @$fn($vty %v, ptr %p, i32 $align, $mvty %m)
-            ret void
-        }
-
-        attributes #0 = { alwaysinline }
-        """
-    quote
-        Base.llvmcall(($ir, "entry"), Cvoid,
-                      Tuple{Ptr{$T}, Vec{$W,$T}, UInt}, p, v, mask_bits)
-    end
-end
-
-# Build a W-bit mask whose low `lanes` bits are set. `lanes` is clamped to
-# [0, W]. Used to mask the row-direction edge of the MR×NR writeback tile.
-@inline function _row_mask(lanes::Int, ::Val{W}) where {W}
-    n = max(0, min(W, lanes))
-    n >= W ? (UInt(1) << W) - UInt(1) : (UInt(1) << n) - UInt(1)
-end
+# `prefix_mask`, `vload_prefix`, `vstore_prefix!` come from `utils.jl`
+# (vendored from a pending SIMD.jl PR). Used to mask the row-direction edge
+# of the MR×NR writeback tile.
 
 # ─── Kernel selection ──────────────────────────────────────────────────────
 
@@ -353,10 +263,15 @@ end
                 rmax = min($MR, mc - rs)
                 base_panel = p * $MR * kc
                 if rmax == $MR
+                    # Bulk MR-element copy via raw `NTuple{MR,VecElement{T}}`
+                    # cast. Works for any `isbitstype(T)` (including
+                    # `ComplexF64`), unlike `SIMD.Vec` which is restricted to
+                    # the scalar number types.
                     for k in 0:kc-1
                         src_off = ((ic + rs - 1) + (pc + k - 1) * ldA) * $sz
                         dst_off = (base_panel + k * $MR) * $sz
-                        _vstore!(pAp + dst_off, _vload(Vec{$MR,$T}, pA + src_off))
+                        nt = unsafe_load(Ptr{NTuple{$MR, VecElement{$T}}}(pA + src_off))
+                        unsafe_store!(Ptr{NTuple{$MR, VecElement{$T}}}(pAp + dst_off), nt)
                     end
                 else
                     for k in 0:kc-1
@@ -533,7 +448,7 @@ end
     # Accumulator init
     init = Expr[]
     for r in 1:rows, j in 1:NR
-        push!(init, :( $(Symbol("c_", r, "_", j)) = _vzero($Vty) ))
+        push!(init, :( $(Symbol("c_", r, "_", j)) = zero($Vty) ))
     end
 
     # Inner k-loop body. `pA`/`pB` are extracted once at the top of the kernel
@@ -542,14 +457,14 @@ end
     for r in 1:rows
         a   = Symbol("a_", r)
         off = (r - 1) * W
-        push!(inner, :( $a = _vload($Vty, pA + (ao + k * $MR + $off) * $sz) ))
+        push!(inner, :( $a = vload($Vty, pA + (ao + k * $MR + $off) * $sz) ))
     end
     for j in 1:NR
         bv = Symbol("bv_", j)
-        push!(inner, :( $bv = _vbcast(unsafe_load(pB, bo + k * $NR + $j), Val($W)) ))
+        push!(inner, :( $bv = $Vty(unsafe_load(pB, bo + k * $NR + $j)) ))
         for r in 1:rows
             c = Symbol("c_", r, "_", j); a = Symbol("a_", r)
-            push!(inner, :( $c = _vfma($a, $bv, $c) ))
+            push!(inner, :( $c = muladd($a, $bv, $c) ))
         end
     end
 
@@ -569,7 +484,7 @@ end
             p    = poff == 0 ? :pCj : :( pCj + $poff )
             push!(write_full, quote
                 let p = $p
-                    _vstore!(p, _vfma(αv, $c, _vload($Vty, p)))
+                    vstore(muladd(αv, $c, vload($Vty, p)), p)
                 end
             end)
         end
@@ -587,7 +502,7 @@ end
     for r in 1:rows
         roff   = (r - 1) * W
         mask_r = Symbol("mask_", r)
-        push!(write_edge, :( $mask_r = _row_mask(mr_ - $roff, Val($W)) ))
+        push!(write_edge, :( $mask_r = prefix_mask(Val($W), mr_ - $roff) ))
     end
     push!(write_edge, :( col_stride_b = ldc * $sz ))
     push!(write_edge, :( pCj = pC + ((cj - 1) * ldc + (ci - 1)) * $sz ))
@@ -600,10 +515,10 @@ end
             poff   = roff * sz
             p      = poff == 0 ? :pCj : :( pCj + $poff )
             push!(body, quote
-                if $mask_r != UInt(0)
+                if any($mask_r)
                     let p = $p
-                        cur = _vmaskedload($Vty, p, $mask_r)
-                        _vmaskedstore!(p, _vfma(αv, $c, cur), $mask_r)
+                        cur = vload($Vty, p, $mask_r)
+                        vstore(muladd(αv, $c, cur), p, $mask_r)
                     end
                 end
             end)
@@ -631,7 +546,7 @@ end
 
             pC  = pointer(C)
             ldc = stride(C, 2)
-            αv  = _vbcast(α, Val($W))
+            αv  = $Vty(α)
             if $full
                 $(write_full...)
             else

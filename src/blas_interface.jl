@@ -884,3 +884,213 @@ for (suffix, T) in ((:s, Float32), (:d, Float64),
         return
     end
 end
+
+# ─── Level 2 BLAS — banded ────────────────────────────────────────────────
+
+# gbmv: y := α·op(A)·x + β·y    (A general band, kl subdiag, ku superdiag)
+# args: (trans, m, n, kl, ku, alpha, A, lda, x, incx, beta, y, incy) + 1 hidden trans len
+for (suffix, T) in ((:s, Float32), (:d, Float64),
+                    (:c, ComplexF32), (:z, ComplexF64))
+    sym = Symbol(suffix, "gbmv_")
+    @eval Base.@ccallable function $sym(trans::Ptr{UInt8},
+            m::Ptr{BlasInt}, n::Ptr{BlasInt},
+            kl::Ptr{BlasInt}, ku::Ptr{BlasInt},
+            α::Ptr{$T}, A::Ptr{$T}, lda::Ptr{BlasInt},
+            x::Ptr{$T}, incx::Ptr{BlasInt},
+            β::Ptr{$T}, y::Ptr{$T}, incy::Ptr{BlasInt},
+            _lt::Csize_t)::Cvoid
+        _gbmv_impl!(unsafe_load(trans),
+                    Int(unsafe_load(m)), Int(unsafe_load(n)),
+                    Int(unsafe_load(kl)), Int(unsafe_load(ku)),
+                    unsafe_load(α), A, Int(unsafe_load(lda)),
+                    x, Int(unsafe_load(incx)),
+                    unsafe_load(β), y, Int(unsafe_load(incy)))
+        return
+    end
+end
+
+# sbmv: y := α·A·x + β·y    (A symmetric band, real)
+# args: (uplo, n, k, alpha, A, lda, x, incx, beta, y, incy) + 1 hidden uplo len
+for (sym, T) in ((:ssbmv_, Float32), (:dsbmv_, Float64))
+    @eval Base.@ccallable function $sym(uplo::Ptr{UInt8},
+            n::Ptr{BlasInt}, k::Ptr{BlasInt},
+            α::Ptr{$T}, A::Ptr{$T}, lda::Ptr{BlasInt},
+            x::Ptr{$T}, incx::Ptr{BlasInt},
+            β::Ptr{$T}, y::Ptr{$T}, incy::Ptr{BlasInt},
+            _lu::Csize_t)::Cvoid
+        _sbmv_impl!(unsafe_load(uplo),
+                    Int(unsafe_load(n)), Int(unsafe_load(k)),
+                    unsafe_load(α), A, Int(unsafe_load(lda)),
+                    x, Int(unsafe_load(incx)),
+                    unsafe_load(β), y, Int(unsafe_load(incy)))
+        return
+    end
+end
+
+# hbmv: y := α·A·x + β·y    (A Hermitian band, complex)
+for (sym, T) in ((:chbmv_, ComplexF32), (:zhbmv_, ComplexF64))
+    @eval Base.@ccallable function $sym(uplo::Ptr{UInt8},
+            n::Ptr{BlasInt}, k::Ptr{BlasInt},
+            α::Ptr{$T}, A::Ptr{$T}, lda::Ptr{BlasInt},
+            x::Ptr{$T}, incx::Ptr{BlasInt},
+            β::Ptr{$T}, y::Ptr{$T}, incy::Ptr{BlasInt},
+            _lu::Csize_t)::Cvoid
+        _hbmv_impl!(unsafe_load(uplo),
+                    Int(unsafe_load(n)), Int(unsafe_load(k)),
+                    unsafe_load(α), A, Int(unsafe_load(lda)),
+                    x, Int(unsafe_load(incx)),
+                    unsafe_load(β), y, Int(unsafe_load(incy)))
+        return
+    end
+end
+
+# tbmv / tbsv: same signature
+# args: (uplo, trans, diag, n, k, A, lda, x, incx) + 3 hidden lens
+for (suffix, T) in ((:s, Float32), (:d, Float64),
+                    (:c, ComplexF32), (:z, ComplexF64))
+    sym_mv = Symbol(suffix, "tbmv_")
+    sym_sv = Symbol(suffix, "tbsv_")
+    @eval begin
+        Base.@ccallable function $sym_mv(uplo::Ptr{UInt8}, trans::Ptr{UInt8},
+                diag::Ptr{UInt8},
+                n::Ptr{BlasInt}, k::Ptr{BlasInt},
+                A::Ptr{$T}, lda::Ptr{BlasInt},
+                x::Ptr{$T}, incx::Ptr{BlasInt},
+                _lu::Csize_t, _lt::Csize_t, _ld::Csize_t)::Cvoid
+            _tbmv_impl!(unsafe_load(uplo), unsafe_load(trans), unsafe_load(diag),
+                        Int(unsafe_load(n)), Int(unsafe_load(k)),
+                        A, Int(unsafe_load(lda)),
+                        x, Int(unsafe_load(incx)))
+            return
+        end
+
+        Base.@ccallable function $sym_sv(uplo::Ptr{UInt8}, trans::Ptr{UInt8},
+                diag::Ptr{UInt8},
+                n::Ptr{BlasInt}, k::Ptr{BlasInt},
+                A::Ptr{$T}, lda::Ptr{BlasInt},
+                x::Ptr{$T}, incx::Ptr{BlasInt},
+                _lu::Csize_t, _lt::Csize_t, _ld::Csize_t)::Cvoid
+            _tbsv_impl!(unsafe_load(uplo), unsafe_load(trans), unsafe_load(diag),
+                        Int(unsafe_load(n)), Int(unsafe_load(k)),
+                        A, Int(unsafe_load(lda)),
+                        x, Int(unsafe_load(incx)))
+            return
+        end
+    end
+end
+
+# ─── Level 2 BLAS — packed ────────────────────────────────────────────────
+
+# spmv: y := α·A·x + β·y    (real symmetric packed)
+# args: (uplo, n, alpha, AP, x, incx, beta, y, incy) + 1 hidden uplo len
+for (sym, T) in ((:sspmv_, Float32), (:dspmv_, Float64))
+    @eval Base.@ccallable function $sym(uplo::Ptr{UInt8}, n::Ptr{BlasInt},
+            α::Ptr{$T}, AP::Ptr{$T},
+            x::Ptr{$T}, incx::Ptr{BlasInt},
+            β::Ptr{$T}, y::Ptr{$T}, incy::Ptr{BlasInt},
+            _lu::Csize_t)::Cvoid
+        _spmv_impl!(unsafe_load(uplo), Int(unsafe_load(n)),
+                    unsafe_load(α), AP,
+                    x, Int(unsafe_load(incx)),
+                    unsafe_load(β), y, Int(unsafe_load(incy)))
+        return
+    end
+end
+
+# hpmv: y := α·A·x + β·y    (complex Hermitian packed)
+for (sym, T) in ((:chpmv_, ComplexF32), (:zhpmv_, ComplexF64))
+    @eval Base.@ccallable function $sym(uplo::Ptr{UInt8}, n::Ptr{BlasInt},
+            α::Ptr{$T}, AP::Ptr{$T},
+            x::Ptr{$T}, incx::Ptr{BlasInt},
+            β::Ptr{$T}, y::Ptr{$T}, incy::Ptr{BlasInt},
+            _lu::Csize_t)::Cvoid
+        _hpmv_impl!(unsafe_load(uplo), Int(unsafe_load(n)),
+                    unsafe_load(α), AP,
+                    x, Int(unsafe_load(incx)),
+                    unsafe_load(β), y, Int(unsafe_load(incy)))
+        return
+    end
+end
+
+# spr: A := α·x·xᵀ + A    (real symmetric packed rank-1)
+# args: (uplo, n, alpha, x, incx, AP) + 1 hidden uplo len
+for (sym, T) in ((:sspr_, Float32), (:dspr_, Float64))
+    @eval Base.@ccallable function $sym(uplo::Ptr{UInt8}, n::Ptr{BlasInt},
+            α::Ptr{$T}, x::Ptr{$T}, incx::Ptr{BlasInt},
+            AP::Ptr{$T}, _lu::Csize_t)::Cvoid
+        _spr_impl!(unsafe_load(uplo), Int(unsafe_load(n)),
+                   unsafe_load(α), x, Int(unsafe_load(incx)), AP)
+        return
+    end
+end
+
+# spr2: A := α·x·yᵀ + α·y·xᵀ + A    (real symmetric packed rank-2)
+for (sym, T) in ((:sspr2_, Float32), (:dspr2_, Float64))
+    @eval Base.@ccallable function $sym(uplo::Ptr{UInt8}, n::Ptr{BlasInt},
+            α::Ptr{$T}, x::Ptr{$T}, incx::Ptr{BlasInt},
+            y::Ptr{$T}, incy::Ptr{BlasInt},
+            AP::Ptr{$T}, _lu::Csize_t)::Cvoid
+        _spr2_impl!(unsafe_load(uplo), Int(unsafe_load(n)),
+                    unsafe_load(α),
+                    x, Int(unsafe_load(incx)),
+                    y, Int(unsafe_load(incy)), AP)
+        return
+    end
+end
+
+# hpr: A := α·x·xᴴ + A    (complex Hermitian packed rank-1, α REAL)
+for (sym, T, TR) in ((:chpr_, ComplexF32, Float32),
+                      (:zhpr_, ComplexF64, Float64))
+    @eval Base.@ccallable function $sym(uplo::Ptr{UInt8}, n::Ptr{BlasInt},
+            α::Ptr{$TR}, x::Ptr{$T}, incx::Ptr{BlasInt},
+            AP::Ptr{$T}, _lu::Csize_t)::Cvoid
+        _hpr_impl!(unsafe_load(uplo), Int(unsafe_load(n)),
+                   unsafe_load(α), x, Int(unsafe_load(incx)), AP)
+        return
+    end
+end
+
+# hpr2: A := α·x·yᴴ + ᾱ·y·xᴴ + A    (Hermitian packed rank-2, α complex)
+for (sym, T) in ((:chpr2_, ComplexF32), (:zhpr2_, ComplexF64))
+    @eval Base.@ccallable function $sym(uplo::Ptr{UInt8}, n::Ptr{BlasInt},
+            α::Ptr{$T}, x::Ptr{$T}, incx::Ptr{BlasInt},
+            y::Ptr{$T}, incy::Ptr{BlasInt},
+            AP::Ptr{$T}, _lu::Csize_t)::Cvoid
+        _hpr2_impl!(unsafe_load(uplo), Int(unsafe_load(n)),
+                    unsafe_load(α),
+                    x, Int(unsafe_load(incx)),
+                    y, Int(unsafe_load(incy)), AP)
+        return
+    end
+end
+
+# tpmv / tpsv: same signature
+# args: (uplo, trans, diag, n, AP, x, incx) + 3 hidden lens
+for (suffix, T) in ((:s, Float32), (:d, Float64),
+                    (:c, ComplexF32), (:z, ComplexF64))
+    sym_mv = Symbol(suffix, "tpmv_")
+    sym_sv = Symbol(suffix, "tpsv_")
+    @eval begin
+        Base.@ccallable function $sym_mv(uplo::Ptr{UInt8}, trans::Ptr{UInt8},
+                diag::Ptr{UInt8}, n::Ptr{BlasInt},
+                AP::Ptr{$T},
+                x::Ptr{$T}, incx::Ptr{BlasInt},
+                _lu::Csize_t, _lt::Csize_t, _ld::Csize_t)::Cvoid
+            _tpmv_impl!(unsafe_load(uplo), unsafe_load(trans), unsafe_load(diag),
+                        Int(unsafe_load(n)), AP,
+                        x, Int(unsafe_load(incx)))
+            return
+        end
+
+        Base.@ccallable function $sym_sv(uplo::Ptr{UInt8}, trans::Ptr{UInt8},
+                diag::Ptr{UInt8}, n::Ptr{BlasInt},
+                AP::Ptr{$T},
+                x::Ptr{$T}, incx::Ptr{BlasInt},
+                _lu::Csize_t, _lt::Csize_t, _ld::Csize_t)::Cvoid
+            _tpsv_impl!(unsafe_load(uplo), unsafe_load(trans), unsafe_load(diag),
+                        Int(unsafe_load(n)), AP,
+                        x, Int(unsafe_load(incx)))
+            return
+        end
+    end
+end

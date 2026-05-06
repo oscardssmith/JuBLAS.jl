@@ -692,6 +692,999 @@ end
 
 # ─── her2: A := α·x·yᴴ + ᾱ·y·xᴴ + A    (A Hermitian, α complex) ──────────
 
+# ─── Banded storage helpers ──────────────────────────────────────────────
+#
+# General band (kl subdiagonals, ku superdiagonals): A[i,j] is at
+# AB[ku+1+i-j, j], i.e. pointer offset (j-1)*lda + (ku+i-j).
+# Symmetric/Hermitian/triangular band, uplo='U' (k superdiagonals):
+#   A[i,j] at AB[k+1+i-j, j]  for max(1,j-k) ≤ i ≤ j
+# uplo='L' (k subdiagonals):
+#   A[i,j] at AB[1+i-j, j]    for j ≤ i ≤ min(n,j+k)
+
+# ─── gbmv: y := α·op(A)·x + β·y    (A general band) ──────────────────────
+
+@inline function _gbmv_impl!(trans::UInt8, m::Int, n::Int,
+                              kl::Int, ku::Int,
+                              α, A::Ptr{T}, lda::Int,
+                              x::Ptr{T}, incx::Int,
+                              β, y::Ptr{T}, incy::Int) where {T}
+    (m <= 0 || n <= 0) && return nothing
+    leny = _isN(trans) ? m : n
+    lenx = _isN(trans) ? n : m
+    _scale_y!(y, leny, incy, β)
+    α == zero(α) && return nothing
+    kx0 = _start_off(lenx, incx)
+    ky0 = _start_off(leny, incy)
+    if _isN(trans)
+        @inbounds for j in 1:n
+            xj = unsafe_load(x, kx0 + (j - 1) * incx + 1)
+            tmp = α * xj
+            colj = (j - 1) * lda
+            i_lo = max(1, j - ku)
+            i_hi = min(m, j + kl)
+            iy = ky0 + (i_lo - 1) * incy
+            for i in i_lo:i_hi
+                aij = unsafe_load(A, colj + (ku + i - j) + 1)
+                unsafe_store!(y, unsafe_load(y, iy + 1) + tmp * aij, iy + 1)
+                iy += incy
+            end
+        end
+    elseif _isT(trans)
+        @inbounds for j in 1:n
+            tmp = zero(T)
+            colj = (j - 1) * lda
+            i_lo = max(1, j - ku)
+            i_hi = min(m, j + kl)
+            ix = kx0 + (i_lo - 1) * incx
+            for i in i_lo:i_hi
+                tmp += unsafe_load(A, colj + (ku + i - j) + 1) * unsafe_load(x, ix + 1)
+                ix += incx
+            end
+            jy = ky0 + (j - 1) * incy
+            unsafe_store!(y, unsafe_load(y, jy + 1) + α * tmp, jy + 1)
+        end
+    else  # 'C'
+        @inbounds for j in 1:n
+            tmp = zero(T)
+            colj = (j - 1) * lda
+            i_lo = max(1, j - ku)
+            i_hi = min(m, j + kl)
+            ix = kx0 + (i_lo - 1) * incx
+            for i in i_lo:i_hi
+                tmp += conj(unsafe_load(A, colj + (ku + i - j) + 1)) * unsafe_load(x, ix + 1)
+                ix += incx
+            end
+            jy = ky0 + (j - 1) * incy
+            unsafe_store!(y, unsafe_load(y, jy + 1) + α * tmp, jy + 1)
+        end
+    end
+    return nothing
+end
+
+# ─── sbmv: y := α·A·x + β·y    (A symmetric band, real) ──────────────────
+
+@inline function _sbmv_impl!(uplo::UInt8, n::Int, k::Int, α,
+                              A::Ptr{T}, lda::Int,
+                              x::Ptr{T}, incx::Int,
+                              β, y::Ptr{T}, incy::Int) where {T<:Real}
+    n <= 0 && return nothing
+    _scale_y!(y, n, incy, β)
+    α == zero(α) && return nothing
+    kx0 = _start_off(n, incx)
+    ky0 = _start_off(n, incy)
+    if _isU(uplo)
+        @inbounds for j in 1:n
+            jx = kx0 + (j - 1) * incx
+            jy = ky0 + (j - 1) * incy
+            tmp1 = α * unsafe_load(x, jx + 1)
+            tmp2 = zero(T)
+            colj = (j - 1) * lda
+            i_lo = max(1, j - k)
+            iy = ky0 + (i_lo - 1) * incy
+            ix = kx0 + (i_lo - 1) * incx
+            for i in i_lo:j-1
+                aij = unsafe_load(A, colj + (k + i - j) + 1)
+                unsafe_store!(y, unsafe_load(y, iy + 1) + tmp1 * aij, iy + 1)
+                tmp2 += aij * unsafe_load(x, ix + 1)
+                iy += incy; ix += incx
+            end
+            ajj = unsafe_load(A, colj + k + 1)  # diagonal
+            unsafe_store!(y, unsafe_load(y, jy + 1) + tmp1 * ajj + α * tmp2, jy + 1)
+        end
+    else
+        @inbounds for j in 1:n
+            jx = kx0 + (j - 1) * incx
+            jy = ky0 + (j - 1) * incy
+            tmp1 = α * unsafe_load(x, jx + 1)
+            tmp2 = zero(T)
+            colj = (j - 1) * lda
+            ajj = unsafe_load(A, colj + 1)  # diagonal at AB[1, j]
+            unsafe_store!(y, unsafe_load(y, jy + 1) + tmp1 * ajj, jy + 1)
+            i_hi = min(n, j + k)
+            iy = ky0 + j * incy
+            ix = kx0 + j * incx
+            for i in j+1:i_hi
+                aij = unsafe_load(A, colj + (i - j) + 1)
+                unsafe_store!(y, unsafe_load(y, iy + 1) + tmp1 * aij, iy + 1)
+                tmp2 += aij * unsafe_load(x, ix + 1)
+                iy += incy; ix += incx
+            end
+            unsafe_store!(y, unsafe_load(y, jy + 1) + α * tmp2, jy + 1)
+        end
+    end
+    return nothing
+end
+
+# ─── hbmv: y := α·A·x + β·y    (A Hermitian band, complex) ───────────────
+
+@inline function _hbmv_impl!(uplo::UInt8, n::Int, k::Int, α,
+                              A::Ptr{Complex{TR}}, lda::Int,
+                              x::Ptr{Complex{TR}}, incx::Int,
+                              β, y::Ptr{Complex{TR}}, incy::Int) where {TR<:Real}
+    T = Complex{TR}
+    n <= 0 && return nothing
+    _scale_y!(y, n, incy, β)
+    α == zero(α) && return nothing
+    kx0 = _start_off(n, incx)
+    ky0 = _start_off(n, incy)
+    if _isU(uplo)
+        @inbounds for j in 1:n
+            jx = kx0 + (j - 1) * incx
+            jy = ky0 + (j - 1) * incy
+            tmp1 = α * unsafe_load(x, jx + 1)
+            tmp2 = zero(T)
+            colj = (j - 1) * lda
+            i_lo = max(1, j - k)
+            iy = ky0 + (i_lo - 1) * incy
+            ix = kx0 + (i_lo - 1) * incx
+            for i in i_lo:j-1
+                aij = unsafe_load(A, colj + (k + i - j) + 1)
+                unsafe_store!(y, unsafe_load(y, iy + 1) + tmp1 * aij, iy + 1)
+                tmp2 += conj(aij) * unsafe_load(x, ix + 1)
+                iy += incy; ix += incx
+            end
+            ajj_re = real(unsafe_load(A, colj + k + 1))
+            unsafe_store!(y, unsafe_load(y, jy + 1) + tmp1 * ajj_re + α * tmp2, jy + 1)
+        end
+    else
+        @inbounds for j in 1:n
+            jx = kx0 + (j - 1) * incx
+            jy = ky0 + (j - 1) * incy
+            tmp1 = α * unsafe_load(x, jx + 1)
+            tmp2 = zero(T)
+            colj = (j - 1) * lda
+            ajj_re = real(unsafe_load(A, colj + 1))
+            unsafe_store!(y, unsafe_load(y, jy + 1) + tmp1 * ajj_re, jy + 1)
+            i_hi = min(n, j + k)
+            iy = ky0 + j * incy
+            ix = kx0 + j * incx
+            for i in j+1:i_hi
+                aij = unsafe_load(A, colj + (i - j) + 1)
+                unsafe_store!(y, unsafe_load(y, iy + 1) + tmp1 * aij, iy + 1)
+                tmp2 += conj(aij) * unsafe_load(x, ix + 1)
+                iy += incy; ix += incx
+            end
+            unsafe_store!(y, unsafe_load(y, jy + 1) + α * tmp2, jy + 1)
+        end
+    end
+    return nothing
+end
+
+# ─── tbmv: x := op(A)·x    (A triangular band, in place) ─────────────────
+#
+# Same column-walking order as trmv to keep the in-place update safe.
+# For uplo='U': A[i,j] at AB[k+1+i-j, j], so the off-diagonal entries on
+# column j live at offsets colj+k+i-j+1 for i=max(1,j-k)..j-1, and the
+# diagonal at colj+k+1.
+# For uplo='L': A[i,j] at AB[1+i-j, j]; off-diagonals at colj+i-j+1 for
+# i=j+1..min(n,j+k), diagonal at colj+1.
+
+@inline function _tbmv_impl!(uplo::UInt8, trans::UInt8, diag::UInt8,
+                              n::Int, k::Int,
+                              A::Ptr{T}, lda::Int,
+                              x::Ptr{T}, incx::Int) where {T}
+    n <= 0 && return nothing
+    nounit = !_isU(diag)
+    kx0 = _start_off(n, incx)
+    if _isN(trans)
+        if _isU(uplo)
+            @inbounds for j in 1:n
+                jx = kx0 + (j - 1) * incx
+                xj = unsafe_load(x, jx + 1)
+                if xj != zero(T)
+                    colj = (j - 1) * lda
+                    i_lo = max(1, j - k)
+                    ix = kx0 + (i_lo - 1) * incx
+                    for i in i_lo:j-1
+                        aij = unsafe_load(A, colj + (k + i - j) + 1)
+                        unsafe_store!(x, unsafe_load(x, ix + 1) + xj * aij, ix + 1)
+                        ix += incx
+                    end
+                    if nounit
+                        unsafe_store!(x, xj * unsafe_load(A, colj + k + 1), jx + 1)
+                    end
+                end
+            end
+        else
+            @inbounds for j in n:-1:1
+                jx = kx0 + (j - 1) * incx
+                xj = unsafe_load(x, jx + 1)
+                if xj != zero(T)
+                    colj = (j - 1) * lda
+                    i_hi = min(n, j + k)
+                    ix = kx0 + j * incx
+                    for i in j+1:i_hi
+                        aij = unsafe_load(A, colj + (i - j) + 1)
+                        unsafe_store!(x, unsafe_load(x, ix + 1) + xj * aij, ix + 1)
+                        ix += incx
+                    end
+                    if nounit
+                        unsafe_store!(x, xj * unsafe_load(A, colj + 1), jx + 1)
+                    end
+                end
+            end
+        end
+    elseif _isT(trans)
+        if _isU(uplo)
+            @inbounds for j in n:-1:1
+                jx = kx0 + (j - 1) * incx
+                colj = (j - 1) * lda
+                tmp = unsafe_load(x, jx + 1)
+                if nounit
+                    tmp = tmp * unsafe_load(A, colj + k + 1)
+                end
+                i_lo = max(1, j - k)
+                ix = kx0 + (i_lo - 1) * incx
+                for i in i_lo:j-1
+                    tmp += unsafe_load(A, colj + (k + i - j) + 1) * unsafe_load(x, ix + 1)
+                    ix += incx
+                end
+                unsafe_store!(x, tmp, jx + 1)
+            end
+        else
+            @inbounds for j in 1:n
+                jx = kx0 + (j - 1) * incx
+                colj = (j - 1) * lda
+                tmp = unsafe_load(x, jx + 1)
+                if nounit
+                    tmp = tmp * unsafe_load(A, colj + 1)
+                end
+                i_hi = min(n, j + k)
+                ix = kx0 + j * incx
+                for i in j+1:i_hi
+                    tmp += unsafe_load(A, colj + (i - j) + 1) * unsafe_load(x, ix + 1)
+                    ix += incx
+                end
+                unsafe_store!(x, tmp, jx + 1)
+            end
+        end
+    else  # 'C'
+        if _isU(uplo)
+            @inbounds for j in n:-1:1
+                jx = kx0 + (j - 1) * incx
+                colj = (j - 1) * lda
+                tmp = unsafe_load(x, jx + 1)
+                if nounit
+                    tmp = tmp * conj(unsafe_load(A, colj + k + 1))
+                end
+                i_lo = max(1, j - k)
+                ix = kx0 + (i_lo - 1) * incx
+                for i in i_lo:j-1
+                    tmp += conj(unsafe_load(A, colj + (k + i - j) + 1)) * unsafe_load(x, ix + 1)
+                    ix += incx
+                end
+                unsafe_store!(x, tmp, jx + 1)
+            end
+        else
+            @inbounds for j in 1:n
+                jx = kx0 + (j - 1) * incx
+                colj = (j - 1) * lda
+                tmp = unsafe_load(x, jx + 1)
+                if nounit
+                    tmp = tmp * conj(unsafe_load(A, colj + 1))
+                end
+                i_hi = min(n, j + k)
+                ix = kx0 + j * incx
+                for i in j+1:i_hi
+                    tmp += conj(unsafe_load(A, colj + (i - j) + 1)) * unsafe_load(x, ix + 1)
+                    ix += incx
+                end
+                unsafe_store!(x, tmp, jx + 1)
+            end
+        end
+    end
+    return nothing
+end
+
+# ─── tbsv: solve op(A)·x = b for x, in place    (A triangular band) ──────
+
+@inline function _tbsv_impl!(uplo::UInt8, trans::UInt8, diag::UInt8,
+                              n::Int, k::Int,
+                              A::Ptr{T}, lda::Int,
+                              x::Ptr{T}, incx::Int) where {T}
+    n <= 0 && return nothing
+    nounit = !_isU(diag)
+    kx0 = _start_off(n, incx)
+    if _isN(trans)
+        if _isU(uplo)
+            @inbounds for j in n:-1:1
+                jx = kx0 + (j - 1) * incx
+                xj = unsafe_load(x, jx + 1)
+                if xj != zero(T)
+                    colj = (j - 1) * lda
+                    if nounit
+                        xj = xj / unsafe_load(A, colj + k + 1)
+                        unsafe_store!(x, xj, jx + 1)
+                    end
+                    i_lo = max(1, j - k)
+                    ix = kx0 + (i_lo - 1) * incx
+                    for i in i_lo:j-1
+                        aij = unsafe_load(A, colj + (k + i - j) + 1)
+                        unsafe_store!(x, unsafe_load(x, ix + 1) - xj * aij, ix + 1)
+                        ix += incx
+                    end
+                end
+            end
+        else
+            @inbounds for j in 1:n
+                jx = kx0 + (j - 1) * incx
+                xj = unsafe_load(x, jx + 1)
+                if xj != zero(T)
+                    colj = (j - 1) * lda
+                    if nounit
+                        xj = xj / unsafe_load(A, colj + 1)
+                        unsafe_store!(x, xj, jx + 1)
+                    end
+                    i_hi = min(n, j + k)
+                    ix = kx0 + j * incx
+                    for i in j+1:i_hi
+                        aij = unsafe_load(A, colj + (i - j) + 1)
+                        unsafe_store!(x, unsafe_load(x, ix + 1) - xj * aij, ix + 1)
+                        ix += incx
+                    end
+                end
+            end
+        end
+    elseif _isT(trans)
+        if _isU(uplo)
+            @inbounds for j in 1:n
+                jx = kx0 + (j - 1) * incx
+                colj = (j - 1) * lda
+                tmp = unsafe_load(x, jx + 1)
+                i_lo = max(1, j - k)
+                ix = kx0 + (i_lo - 1) * incx
+                for i in i_lo:j-1
+                    tmp -= unsafe_load(A, colj + (k + i - j) + 1) * unsafe_load(x, ix + 1)
+                    ix += incx
+                end
+                if nounit
+                    tmp = tmp / unsafe_load(A, colj + k + 1)
+                end
+                unsafe_store!(x, tmp, jx + 1)
+            end
+        else
+            @inbounds for j in n:-1:1
+                jx = kx0 + (j - 1) * incx
+                colj = (j - 1) * lda
+                tmp = unsafe_load(x, jx + 1)
+                i_hi = min(n, j + k)
+                ix = kx0 + j * incx
+                for i in j+1:i_hi
+                    tmp -= unsafe_load(A, colj + (i - j) + 1) * unsafe_load(x, ix + 1)
+                    ix += incx
+                end
+                if nounit
+                    tmp = tmp / unsafe_load(A, colj + 1)
+                end
+                unsafe_store!(x, tmp, jx + 1)
+            end
+        end
+    else  # 'C'
+        if _isU(uplo)
+            @inbounds for j in 1:n
+                jx = kx0 + (j - 1) * incx
+                colj = (j - 1) * lda
+                tmp = unsafe_load(x, jx + 1)
+                i_lo = max(1, j - k)
+                ix = kx0 + (i_lo - 1) * incx
+                for i in i_lo:j-1
+                    tmp -= conj(unsafe_load(A, colj + (k + i - j) + 1)) * unsafe_load(x, ix + 1)
+                    ix += incx
+                end
+                if nounit
+                    tmp = tmp / conj(unsafe_load(A, colj + k + 1))
+                end
+                unsafe_store!(x, tmp, jx + 1)
+            end
+        else
+            @inbounds for j in n:-1:1
+                jx = kx0 + (j - 1) * incx
+                colj = (j - 1) * lda
+                tmp = unsafe_load(x, jx + 1)
+                i_hi = min(n, j + k)
+                ix = kx0 + j * incx
+                for i in j+1:i_hi
+                    tmp -= conj(unsafe_load(A, colj + (i - j) + 1)) * unsafe_load(x, ix + 1)
+                    ix += incx
+                end
+                if nounit
+                    tmp = tmp / conj(unsafe_load(A, colj + 1))
+                end
+                unsafe_store!(x, tmp, jx + 1)
+            end
+        end
+    end
+    return nothing
+end
+
+# ─── Packed storage helpers ──────────────────────────────────────────────
+#
+# Upper packed: A[i,j] (i ≤ j) at AP[(j-1)j/2 + i].
+# Lower packed: A[i,j] (i ≥ j) at AP[(j-1)(2n-j+2)/2 + (i-j+1)].
+# The kernels track `kk` (1-indexed start of column j's chunk in AP)
+# incrementally: kk += j for upper, kk += n-j+1 for lower.
+
+# ─── spmv: y := α·A·x + β·y    (A symmetric, packed real) ────────────────
+
+@inline function _spmv_impl!(uplo::UInt8, n::Int, α,
+                              AP::Ptr{T},
+                              x::Ptr{T}, incx::Int,
+                              β, y::Ptr{T}, incy::Int) where {T<:Real}
+    n <= 0 && return nothing
+    _scale_y!(y, n, incy, β)
+    α == zero(α) && return nothing
+    kx0 = _start_off(n, incx)
+    ky0 = _start_off(n, incy)
+    if _isU(uplo)
+        kk = 1
+        @inbounds for j in 1:n
+            jx = kx0 + (j - 1) * incx
+            jy = ky0 + (j - 1) * incy
+            tmp1 = α * unsafe_load(x, jx + 1)
+            tmp2 = zero(T)
+            ix = kx0; iy = ky0
+            for i in 1:j-1
+                aij = unsafe_load(AP, kk + i - 1)
+                unsafe_store!(y, unsafe_load(y, iy + 1) + tmp1 * aij, iy + 1)
+                tmp2 += aij * unsafe_load(x, ix + 1)
+                ix += incx; iy += incy
+            end
+            ajj = unsafe_load(AP, kk + j - 1)
+            unsafe_store!(y, unsafe_load(y, jy + 1) + tmp1 * ajj + α * tmp2, jy + 1)
+            kk += j
+        end
+    else
+        kk = 1
+        @inbounds for j in 1:n
+            jx = kx0 + (j - 1) * incx
+            jy = ky0 + (j - 1) * incy
+            tmp1 = α * unsafe_load(x, jx + 1)
+            tmp2 = zero(T)
+            ajj = unsafe_load(AP, kk)
+            unsafe_store!(y, unsafe_load(y, jy + 1) + tmp1 * ajj, jy + 1)
+            ix = kx0 + j * incx; iy = ky0 + j * incy
+            for i in j+1:n
+                aij = unsafe_load(AP, kk + i - j)
+                unsafe_store!(y, unsafe_load(y, iy + 1) + tmp1 * aij, iy + 1)
+                tmp2 += aij * unsafe_load(x, ix + 1)
+                ix += incx; iy += incy
+            end
+            unsafe_store!(y, unsafe_load(y, jy + 1) + α * tmp2, jy + 1)
+            kk += n - j + 1
+        end
+    end
+    return nothing
+end
+
+# ─── hpmv: y := α·A·x + β·y    (A Hermitian, packed complex) ─────────────
+
+@inline function _hpmv_impl!(uplo::UInt8, n::Int, α,
+                              AP::Ptr{Complex{TR}},
+                              x::Ptr{Complex{TR}}, incx::Int,
+                              β, y::Ptr{Complex{TR}}, incy::Int) where {TR<:Real}
+    T = Complex{TR}
+    n <= 0 && return nothing
+    _scale_y!(y, n, incy, β)
+    α == zero(α) && return nothing
+    kx0 = _start_off(n, incx)
+    ky0 = _start_off(n, incy)
+    if _isU(uplo)
+        kk = 1
+        @inbounds for j in 1:n
+            jx = kx0 + (j - 1) * incx
+            jy = ky0 + (j - 1) * incy
+            tmp1 = α * unsafe_load(x, jx + 1)
+            tmp2 = zero(T)
+            ix = kx0; iy = ky0
+            for i in 1:j-1
+                aij = unsafe_load(AP, kk + i - 1)
+                unsafe_store!(y, unsafe_load(y, iy + 1) + tmp1 * aij, iy + 1)
+                tmp2 += conj(aij) * unsafe_load(x, ix + 1)
+                ix += incx; iy += incy
+            end
+            ajj_re = real(unsafe_load(AP, kk + j - 1))
+            unsafe_store!(y, unsafe_load(y, jy + 1) + tmp1 * ajj_re + α * tmp2, jy + 1)
+            kk += j
+        end
+    else
+        kk = 1
+        @inbounds for j in 1:n
+            jx = kx0 + (j - 1) * incx
+            jy = ky0 + (j - 1) * incy
+            tmp1 = α * unsafe_load(x, jx + 1)
+            tmp2 = zero(T)
+            ajj_re = real(unsafe_load(AP, kk))
+            unsafe_store!(y, unsafe_load(y, jy + 1) + tmp1 * ajj_re, jy + 1)
+            ix = kx0 + j * incx; iy = ky0 + j * incy
+            for i in j+1:n
+                aij = unsafe_load(AP, kk + i - j)
+                unsafe_store!(y, unsafe_load(y, iy + 1) + tmp1 * aij, iy + 1)
+                tmp2 += conj(aij) * unsafe_load(x, ix + 1)
+                ix += incx; iy += incy
+            end
+            unsafe_store!(y, unsafe_load(y, jy + 1) + α * tmp2, jy + 1)
+            kk += n - j + 1
+        end
+    end
+    return nothing
+end
+
+# ─── spr: A := α·x·xᵀ + A    (A symmetric, packed real) ──────────────────
+
+@inline function _spr_impl!(uplo::UInt8, n::Int, α,
+                             x::Ptr{T}, incx::Int, AP::Ptr{T}) where {T<:Real}
+    (n <= 0 || α == zero(α)) && return nothing
+    kx0 = _start_off(n, incx)
+    if _isU(uplo)
+        kk = 1
+        @inbounds for j in 1:n
+            jx = kx0 + (j - 1) * incx
+            xj = unsafe_load(x, jx + 1)
+            if xj != zero(T)
+                tmp = α * xj
+                ix = kx0
+                for i in 1:j
+                    off = kk + i - 1
+                    unsafe_store!(AP, unsafe_load(AP, off) + tmp * unsafe_load(x, ix + 1), off)
+                    ix += incx
+                end
+            end
+            kk += j
+        end
+    else
+        kk = 1
+        @inbounds for j in 1:n
+            jx = kx0 + (j - 1) * incx
+            xj = unsafe_load(x, jx + 1)
+            if xj != zero(T)
+                tmp = α * xj
+                ix = jx
+                for i in j:n
+                    off = kk + i - j
+                    unsafe_store!(AP, unsafe_load(AP, off) + tmp * unsafe_load(x, ix + 1), off)
+                    ix += incx
+                end
+            end
+            kk += n - j + 1
+        end
+    end
+    return nothing
+end
+
+# ─── spr2: A := α·x·yᵀ + α·y·xᵀ + A    (real symmetric, packed) ─────────
+
+@inline function _spr2_impl!(uplo::UInt8, n::Int, α,
+                              x::Ptr{T}, incx::Int,
+                              y::Ptr{T}, incy::Int,
+                              AP::Ptr{T}) where {T<:Real}
+    (n <= 0 || α == zero(α)) && return nothing
+    kx0 = _start_off(n, incx)
+    ky0 = _start_off(n, incy)
+    if _isU(uplo)
+        kk = 1
+        @inbounds for j in 1:n
+            jx = kx0 + (j - 1) * incx
+            jy = ky0 + (j - 1) * incy
+            xj = unsafe_load(x, jx + 1)
+            yj = unsafe_load(y, jy + 1)
+            if xj != zero(T) || yj != zero(T)
+                tmp1 = α * yj
+                tmp2 = α * xj
+                ix = kx0; iy = ky0
+                for i in 1:j
+                    off = kk + i - 1
+                    unsafe_store!(AP,
+                        unsafe_load(AP, off) +
+                            unsafe_load(x, ix + 1) * tmp1 +
+                            unsafe_load(y, iy + 1) * tmp2, off)
+                    ix += incx; iy += incy
+                end
+            end
+            kk += j
+        end
+    else
+        kk = 1
+        @inbounds for j in 1:n
+            jx = kx0 + (j - 1) * incx
+            jy = ky0 + (j - 1) * incy
+            xj = unsafe_load(x, jx + 1)
+            yj = unsafe_load(y, jy + 1)
+            if xj != zero(T) || yj != zero(T)
+                tmp1 = α * yj
+                tmp2 = α * xj
+                ix = jx; iy = jy
+                for i in j:n
+                    off = kk + i - j
+                    unsafe_store!(AP,
+                        unsafe_load(AP, off) +
+                            unsafe_load(x, ix + 1) * tmp1 +
+                            unsafe_load(y, iy + 1) * tmp2, off)
+                    ix += incx; iy += incy
+                end
+            end
+            kk += n - j + 1
+        end
+    end
+    return nothing
+end
+
+# ─── hpr: A := α·x·xᴴ + A    (A Hermitian, packed, α real) ───────────────
+
+@inline function _hpr_impl!(uplo::UInt8, n::Int, α::TR,
+                             x::Ptr{Complex{TR}}, incx::Int,
+                             AP::Ptr{Complex{TR}}) where {TR<:Real}
+    T = Complex{TR}
+    (n <= 0 || α == zero(α)) && return nothing
+    kx0 = _start_off(n, incx)
+    if _isU(uplo)
+        kk = 1
+        @inbounds for j in 1:n
+            jx = kx0 + (j - 1) * incx
+            xj = unsafe_load(x, jx + 1)
+            if xj != zero(T)
+                tmp = α * conj(xj)
+                ix = kx0
+                for i in 1:j-1
+                    off = kk + i - 1
+                    unsafe_store!(AP, unsafe_load(AP, off) + unsafe_load(x, ix + 1) * tmp, off)
+                    ix += incx
+                end
+                diag_off = kk + j - 1
+                ajj = unsafe_load(AP, diag_off)
+                unsafe_store!(AP, complex(real(ajj) + real(xj * tmp), zero(TR)), diag_off)
+            end
+            kk += j
+        end
+    else
+        kk = 1
+        @inbounds for j in 1:n
+            jx = kx0 + (j - 1) * incx
+            xj = unsafe_load(x, jx + 1)
+            if xj != zero(T)
+                tmp = α * conj(xj)
+                ajj = unsafe_load(AP, kk)
+                unsafe_store!(AP, complex(real(ajj) + real(xj * tmp), zero(TR)), kk)
+                ix = kx0 + j * incx
+                for i in j+1:n
+                    off = kk + i - j
+                    unsafe_store!(AP, unsafe_load(AP, off) + unsafe_load(x, ix + 1) * tmp, off)
+                    ix += incx
+                end
+            end
+            kk += n - j + 1
+        end
+    end
+    return nothing
+end
+
+# ─── hpr2: A := α·x·yᴴ + ᾱ·y·xᴴ + A    (Hermitian packed, α complex) ────
+
+@inline function _hpr2_impl!(uplo::UInt8, n::Int, α,
+                              x::Ptr{Complex{TR}}, incx::Int,
+                              y::Ptr{Complex{TR}}, incy::Int,
+                              AP::Ptr{Complex{TR}}) where {TR<:Real}
+    T = Complex{TR}
+    (n <= 0 || α == zero(α)) && return nothing
+    kx0 = _start_off(n, incx)
+    ky0 = _start_off(n, incy)
+    if _isU(uplo)
+        kk = 1
+        @inbounds for j in 1:n
+            jx = kx0 + (j - 1) * incx
+            jy = ky0 + (j - 1) * incy
+            xj = unsafe_load(x, jx + 1)
+            yj = unsafe_load(y, jy + 1)
+            if xj != zero(T) || yj != zero(T)
+                tmp1 = α * conj(yj)
+                tmp2 = conj(α) * conj(xj)
+                ix = kx0; iy = ky0
+                for i in 1:j-1
+                    off = kk + i - 1
+                    unsafe_store!(AP,
+                        unsafe_load(AP, off) +
+                            unsafe_load(x, ix + 1) * tmp1 +
+                            unsafe_load(y, iy + 1) * tmp2, off)
+                    ix += incx; iy += incy
+                end
+                diag_off = kk + j - 1
+                ajj = unsafe_load(AP, diag_off)
+                unsafe_store!(AP,
+                    complex(real(ajj) + real(xj * tmp1 + yj * tmp2), zero(TR)),
+                    diag_off)
+            end
+            kk += j
+        end
+    else
+        kk = 1
+        @inbounds for j in 1:n
+            jx = kx0 + (j - 1) * incx
+            jy = ky0 + (j - 1) * incy
+            xj = unsafe_load(x, jx + 1)
+            yj = unsafe_load(y, jy + 1)
+            if xj != zero(T) || yj != zero(T)
+                tmp1 = α * conj(yj)
+                tmp2 = conj(α) * conj(xj)
+                ajj = unsafe_load(AP, kk)
+                unsafe_store!(AP,
+                    complex(real(ajj) + real(xj * tmp1 + yj * tmp2), zero(TR)), kk)
+                ix = kx0 + j * incx; iy = ky0 + j * incy
+                for i in j+1:n
+                    off = kk + i - j
+                    unsafe_store!(AP,
+                        unsafe_load(AP, off) +
+                            unsafe_load(x, ix + 1) * tmp1 +
+                            unsafe_load(y, iy + 1) * tmp2, off)
+                    ix += incx; iy += incy
+                end
+            end
+            kk += n - j + 1
+        end
+    end
+    return nothing
+end
+
+# ─── tpmv: x := op(A)·x    (A triangular, packed, in place) ──────────────
+
+@inline function _tpmv_impl!(uplo::UInt8, trans::UInt8, diag::UInt8,
+                              n::Int, AP::Ptr{T},
+                              x::Ptr{T}, incx::Int) where {T}
+    n <= 0 && return nothing
+    nounit = !_isU(diag)
+    kx0 = _start_off(n, incx)
+    if _isN(trans)
+        if _isU(uplo)
+            kk = 1
+            @inbounds for j in 1:n
+                jx = kx0 + (j - 1) * incx
+                xj = unsafe_load(x, jx + 1)
+                if xj != zero(T)
+                    ix = kx0
+                    for i in 1:j-1
+                        unsafe_store!(x,
+                            unsafe_load(x, ix + 1) + xj * unsafe_load(AP, kk + i - 1),
+                            ix + 1)
+                        ix += incx
+                    end
+                    if nounit
+                        unsafe_store!(x, xj * unsafe_load(AP, kk + j - 1), jx + 1)
+                    end
+                end
+                kk += j
+            end
+        else
+            kk = n * (n + 1) ÷ 2
+            @inbounds for j in n:-1:1
+                jx = kx0 + (j - 1) * incx
+                xj = unsafe_load(x, jx + 1)
+                if xj != zero(T)
+                    ix = kx0 + (n - 1) * incx
+                    for i in n:-1:j+1
+                        unsafe_store!(x,
+                            unsafe_load(x, ix + 1) + xj * unsafe_load(AP, kk - (n - i)),
+                            ix + 1)
+                        ix -= incx
+                    end
+                    if nounit
+                        unsafe_store!(x, xj * unsafe_load(AP, kk - (n - j)), jx + 1)
+                    end
+                end
+                kk -= n - j + 1
+            end
+        end
+    elseif _isT(trans)
+        if _isU(uplo)
+            kk = n * (n + 1) ÷ 2
+            @inbounds for j in n:-1:1
+                jx = kx0 + (j - 1) * incx
+                tmp = unsafe_load(x, jx + 1)
+                if nounit
+                    tmp = tmp * unsafe_load(AP, kk)
+                end
+                ix = kx0 + (j - 2) * incx
+                for i in j-1:-1:1
+                    tmp += unsafe_load(AP, kk - (j - i)) * unsafe_load(x, ix + 1)
+                    ix -= incx
+                end
+                unsafe_store!(x, tmp, jx + 1)
+                kk -= j
+            end
+        else
+            kk = 1
+            @inbounds for j in 1:n
+                jx = kx0 + (j - 1) * incx
+                tmp = unsafe_load(x, jx + 1)
+                if nounit
+                    tmp = tmp * unsafe_load(AP, kk)
+                end
+                ix = kx0 + j * incx
+                for i in j+1:n
+                    tmp += unsafe_load(AP, kk + i - j) * unsafe_load(x, ix + 1)
+                    ix += incx
+                end
+                unsafe_store!(x, tmp, jx + 1)
+                kk += n - j + 1
+            end
+        end
+    else  # 'C'
+        if _isU(uplo)
+            kk = n * (n + 1) ÷ 2
+            @inbounds for j in n:-1:1
+                jx = kx0 + (j - 1) * incx
+                tmp = unsafe_load(x, jx + 1)
+                if nounit
+                    tmp = tmp * conj(unsafe_load(AP, kk))
+                end
+                ix = kx0 + (j - 2) * incx
+                for i in j-1:-1:1
+                    tmp += conj(unsafe_load(AP, kk - (j - i))) * unsafe_load(x, ix + 1)
+                    ix -= incx
+                end
+                unsafe_store!(x, tmp, jx + 1)
+                kk -= j
+            end
+        else
+            kk = 1
+            @inbounds for j in 1:n
+                jx = kx0 + (j - 1) * incx
+                tmp = unsafe_load(x, jx + 1)
+                if nounit
+                    tmp = tmp * conj(unsafe_load(AP, kk))
+                end
+                ix = kx0 + j * incx
+                for i in j+1:n
+                    tmp += conj(unsafe_load(AP, kk + i - j)) * unsafe_load(x, ix + 1)
+                    ix += incx
+                end
+                unsafe_store!(x, tmp, jx + 1)
+                kk += n - j + 1
+            end
+        end
+    end
+    return nothing
+end
+
+# ─── tpsv: solve op(A)·x = b for x, in place    (A triangular packed) ────
+
+@inline function _tpsv_impl!(uplo::UInt8, trans::UInt8, diag::UInt8,
+                              n::Int, AP::Ptr{T},
+                              x::Ptr{T}, incx::Int) where {T}
+    n <= 0 && return nothing
+    nounit = !_isU(diag)
+    kx0 = _start_off(n, incx)
+    if _isN(trans)
+        if _isU(uplo)
+            kk = n * (n + 1) ÷ 2
+            @inbounds for j in n:-1:1
+                jx = kx0 + (j - 1) * incx
+                xj = unsafe_load(x, jx + 1)
+                if xj != zero(T)
+                    if nounit
+                        xj = xj / unsafe_load(AP, kk)
+                        unsafe_store!(x, xj, jx + 1)
+                    end
+                    ix = kx0 + (j - 2) * incx
+                    for i in j-1:-1:1
+                        unsafe_store!(x,
+                            unsafe_load(x, ix + 1) - xj * unsafe_load(AP, kk - (j - i)),
+                            ix + 1)
+                        ix -= incx
+                    end
+                end
+                kk -= j
+            end
+        else
+            kk = 1
+            @inbounds for j in 1:n
+                jx = kx0 + (j - 1) * incx
+                xj = unsafe_load(x, jx + 1)
+                if xj != zero(T)
+                    if nounit
+                        xj = xj / unsafe_load(AP, kk)
+                        unsafe_store!(x, xj, jx + 1)
+                    end
+                    ix = kx0 + j * incx
+                    for i in j+1:n
+                        unsafe_store!(x,
+                            unsafe_load(x, ix + 1) - xj * unsafe_load(AP, kk + i - j),
+                            ix + 1)
+                        ix += incx
+                    end
+                end
+                kk += n - j + 1
+            end
+        end
+    elseif _isT(trans)
+        if _isU(uplo)
+            kk = 1
+            @inbounds for j in 1:n
+                jx = kx0 + (j - 1) * incx
+                tmp = unsafe_load(x, jx + 1)
+                ix = kx0
+                for i in 1:j-1
+                    tmp -= unsafe_load(AP, kk + i - 1) * unsafe_load(x, ix + 1)
+                    ix += incx
+                end
+                if nounit
+                    tmp = tmp / unsafe_load(AP, kk + j - 1)
+                end
+                unsafe_store!(x, tmp, jx + 1)
+                kk += j
+            end
+        else
+            kk = n * (n + 1) ÷ 2
+            @inbounds for j in n:-1:1
+                jx = kx0 + (j - 1) * incx
+                tmp = unsafe_load(x, jx + 1)
+                ix = kx0 + (n - 1) * incx
+                for i in n:-1:j+1
+                    tmp -= unsafe_load(AP, kk - (n - i)) * unsafe_load(x, ix + 1)
+                    ix -= incx
+                end
+                if nounit
+                    tmp = tmp / unsafe_load(AP, kk - (n - j))
+                end
+                unsafe_store!(x, tmp, jx + 1)
+                kk -= n - j + 1
+            end
+        end
+    else  # 'C'
+        if _isU(uplo)
+            kk = 1
+            @inbounds for j in 1:n
+                jx = kx0 + (j - 1) * incx
+                tmp = unsafe_load(x, jx + 1)
+                ix = kx0
+                for i in 1:j-1
+                    tmp -= conj(unsafe_load(AP, kk + i - 1)) * unsafe_load(x, ix + 1)
+                    ix += incx
+                end
+                if nounit
+                    tmp = tmp / conj(unsafe_load(AP, kk + j - 1))
+                end
+                unsafe_store!(x, tmp, jx + 1)
+                kk += j
+            end
+        else
+            kk = n * (n + 1) ÷ 2
+            @inbounds for j in n:-1:1
+                jx = kx0 + (j - 1) * incx
+                tmp = unsafe_load(x, jx + 1)
+                ix = kx0 + (n - 1) * incx
+                for i in n:-1:j+1
+                    tmp -= conj(unsafe_load(AP, kk - (n - i))) * unsafe_load(x, ix + 1)
+                    ix -= incx
+                end
+                if nounit
+                    tmp = tmp / conj(unsafe_load(AP, kk - (n - j)))
+                end
+                unsafe_store!(x, tmp, jx + 1)
+                kk -= n - j + 1
+            end
+        end
+    end
+    return nothing
+end
+
 @inline function _her2_impl!(uplo::UInt8, n::Int, α,
                               x::Ptr{Complex{TR}}, incx::Int,
                               y::Ptr{Complex{TR}}, incy::Int,

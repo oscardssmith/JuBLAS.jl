@@ -591,6 +591,336 @@ for (jname, sym, T) in (
     end
 end
 
+# ── Banded shims ──
+
+# gbmv: trans, m, n, kl, ku, alpha, A, lda, x, incx, beta, y, incy + 1 hidden len
+for (jname, sym, T) in (
+        (:sgbmv, :sgbmv_, Float32),    (:dgbmv, :dgbmv_, Float64),
+        (:cgbmv, :cgbmv_, ComplexF32), (:zgbmv, :zgbmv_, ComplexF64),
+    )
+    @eval function $jname(handle, trans::Char, m::Int, n::Int,
+                          kl::Int, ku::Int, α::$T,
+                          A::AbstractMatrix{$T}, lda::Int,
+                          x::AbstractVector{$T}, incx::Int,
+                          β::$T, y::AbstractVector{$T}, incy::Int)
+        ptr = Libdl.dlsym(handle, $(QuoteNode(sym)))
+        ccall(ptr, Cvoid,
+              (Ref{UInt8}, Ref{BlasInt}, Ref{BlasInt},
+               Ref{BlasInt}, Ref{BlasInt},
+               Ref{$T}, Ptr{$T}, Ref{BlasInt},
+               Ptr{$T}, Ref{BlasInt},
+               Ref{$T}, Ptr{$T}, Ref{BlasInt}, Csize_t),
+              UInt8(trans), BlasInt(m), BlasInt(n),
+              BlasInt(kl), BlasInt(ku),
+              α, A, BlasInt(lda),
+              x, BlasInt(incx),
+              β, y, BlasInt(incy), Csize_t(1))
+        return y
+    end
+end
+
+# sbmv / hbmv: uplo, n, k, alpha, A, lda, x, incx, beta, y, incy + 1 hidden len
+for (jname, sym, T) in (
+        (:ssbmv, :ssbmv_, Float32),    (:dsbmv, :dsbmv_, Float64),
+        (:chbmv, :chbmv_, ComplexF32), (:zhbmv, :zhbmv_, ComplexF64),
+    )
+    @eval function $jname(handle, uplo::Char, n::Int, k::Int, α::$T,
+                          A::AbstractMatrix{$T}, lda::Int,
+                          x::AbstractVector{$T}, incx::Int,
+                          β::$T, y::AbstractVector{$T}, incy::Int)
+        ptr = Libdl.dlsym(handle, $(QuoteNode(sym)))
+        ccall(ptr, Cvoid,
+              (Ref{UInt8}, Ref{BlasInt}, Ref{BlasInt},
+               Ref{$T}, Ptr{$T}, Ref{BlasInt},
+               Ptr{$T}, Ref{BlasInt},
+               Ref{$T}, Ptr{$T}, Ref{BlasInt}, Csize_t),
+              UInt8(uplo), BlasInt(n), BlasInt(k),
+              α, A, BlasInt(lda),
+              x, BlasInt(incx),
+              β, y, BlasInt(incy), Csize_t(1))
+        return y
+    end
+end
+
+# tbmv / tbsv: uplo, trans, diag, n, k, A, lda, x, incx + 3 hidden lens
+for (jname, sym, T) in (
+        (:stbmv, :stbmv_, Float32),    (:dtbmv, :dtbmv_, Float64),
+        (:ctbmv, :ctbmv_, ComplexF32), (:ztbmv, :ztbmv_, ComplexF64),
+        (:stbsv, :stbsv_, Float32),    (:dtbsv, :dtbsv_, Float64),
+        (:ctbsv, :ctbsv_, ComplexF32), (:ztbsv, :ztbsv_, ComplexF64),
+    )
+    @eval function $jname(handle, uplo::Char, trans::Char, diag::Char,
+                          n::Int, k::Int,
+                          A::AbstractMatrix{$T}, lda::Int,
+                          x::AbstractVector{$T}, incx::Int)
+        ptr = Libdl.dlsym(handle, $(QuoteNode(sym)))
+        ccall(ptr, Cvoid,
+              (Ref{UInt8}, Ref{UInt8}, Ref{UInt8},
+               Ref{BlasInt}, Ref{BlasInt},
+               Ptr{$T}, Ref{BlasInt}, Ptr{$T}, Ref{BlasInt},
+               Csize_t, Csize_t, Csize_t),
+              UInt8(uplo), UInt8(trans), UInt8(diag),
+              BlasInt(n), BlasInt(k),
+              A, BlasInt(lda), x, BlasInt(incx),
+              Csize_t(1), Csize_t(1), Csize_t(1))
+        return x
+    end
+end
+
+# Band-storage helpers.
+
+# Convert dense `A_dense` (m×n, with non-zeros only in the kl-sub/ku-super
+# band) into the Fortran band storage format AB of shape lda×n where
+# AB[ku+1+i-j, j] = A[i,j] for max(1,j-ku) ≤ i ≤ min(m,j+kl).
+function dense_to_gb(A_dense::AbstractMatrix{T}, kl::Int, ku::Int, lda::Int) where {T}
+    m, n = size(A_dense)
+    @assert lda >= kl + ku + 1
+    AB = zeros(T, lda, n)
+    for j in 1:n, i in max(1, j-ku):min(m, j+kl)
+        AB[ku + 1 + i - j, j] = A_dense[i, j]
+    end
+    return AB
+end
+
+# Symmetric/Hermitian/triangular upper band: AB[k+1+i-j, j] = A[i,j].
+function dense_to_band_U(A_dense::AbstractMatrix{T}, k::Int, lda::Int) where {T}
+    n = size(A_dense, 1)
+    @assert lda >= k + 1
+    AB = zeros(T, lda, n)
+    for j in 1:n, i in max(1, j-k):j
+        AB[k + 1 + i - j, j] = A_dense[i, j]
+    end
+    return AB
+end
+
+# Lower band: AB[1+i-j, j] = A[i,j].
+function dense_to_band_L(A_dense::AbstractMatrix{T}, k::Int, lda::Int) where {T}
+    n = size(A_dense, 1)
+    @assert lda >= k + 1
+    AB = zeros(T, lda, n)
+    for j in 1:n, i in j:min(n, j+k)
+        AB[1 + i - j, j] = A_dense[i, j]
+    end
+    return AB
+end
+
+# Build a random dense matrix with non-zeros only in the (kl, ku)-band.
+function rand_band_dense(::Type{T}, m::Int, n::Int, kl::Int, ku::Int, rng) where {T}
+    A = zeros(T, m, n)
+    for j in 1:n, i in max(1, j-ku):min(m, j+kl)
+        A[i, j] = randn(rng, T)
+    end
+    return A
+end
+
+# Random symmetric / Hermitian band matrix (full dense form, with the
+# Symmetric/Hermitian invariant enforced explicitly).
+function rand_sym_band_dense(::Type{T}, n::Int, k::Int, rng) where {T<:Real}
+    A = zeros(T, n, n)
+    for j in 1:n, i in max(1, j-k):j
+        v = randn(rng, T)
+        A[i, j] = v
+        i != j && (A[j, i] = v)
+    end
+    return A
+end
+
+function rand_herm_band_dense(::Type{T}, n::Int, k::Int, rng) where {T<:Complex}
+    TR = real(T)
+    A = zeros(T, n, n)
+    for j in 1:n
+        A[j, j] = T(randn(rng, TR))  # diagonal real
+        for i in max(1, j-k):j-1
+            v = randn(rng, T)
+            A[i, j] = v
+            A[j, i] = conj(v)
+        end
+    end
+    return A
+end
+
+# Diagonally-dominant random triangular band (for tbsv stability).
+function rand_tri_band_dense(::Type{T}, n::Int, k::Int, uplo::Char, rng) where {T}
+    A = zeros(T, n, n)
+    if uplo == 'U'
+        for j in 1:n, i in max(1, j-k):j
+            A[i, j] = randn(rng, T) / T(n)
+            i == j && (A[i, j] += T(1))
+        end
+    else
+        for j in 1:n, i in j:min(n, j+k)
+            A[i, j] = randn(rng, T) / T(n)
+            i == j && (A[i, j] += T(1))
+        end
+    end
+    return A
+end
+
+# ── Packed-storage helpers ──
+
+# Pack the upper triangle of A column-by-column into AP (length n(n+1)/2).
+# AP[(j-1)j/2 + i] = A[i,j] for i ≤ j.
+function dense_to_packed_U(A::AbstractMatrix{T}) where {T}
+    n = size(A, 1)
+    AP = Vector{T}(undef, n * (n + 1) ÷ 2)
+    kk = 1
+    for j in 1:n
+        for i in 1:j
+            AP[kk + i - 1] = A[i, j]
+        end
+        kk += j
+    end
+    return AP
+end
+
+# Pack the lower triangle column-by-column. AP[kk + (i-j)] = A[i,j] for i ≥ j.
+function dense_to_packed_L(A::AbstractMatrix{T}) where {T}
+    n = size(A, 1)
+    AP = Vector{T}(undef, n * (n + 1) ÷ 2)
+    kk = 1
+    for j in 1:n
+        for i in j:n
+            AP[kk + i - j] = A[i, j]
+        end
+        kk += n - j + 1
+    end
+    return AP
+end
+
+# Inverse of the above — read AP back into a dense (full) matrix mirroring
+# the symmetric/Hermitian invariant. `mirror` = `:sym` (copy) or `:herm`
+# (conjugate copy) for the unstored triangle.
+function packed_to_dense(AP::AbstractVector{T}, n::Int, uplo::Char, mirror::Symbol) where {T}
+    A = zeros(T, n, n)
+    if uplo == 'U'
+        kk = 1
+        for j in 1:n
+            for i in 1:j
+                A[i, j] = AP[kk + i - 1]
+                if i != j
+                    A[j, i] = mirror === :herm ? conj(A[i, j]) : A[i, j]
+                end
+            end
+            kk += j
+        end
+    else
+        kk = 1
+        for j in 1:n
+            for i in j:n
+                A[i, j] = AP[kk + i - j]
+                if i != j
+                    A[j, i] = mirror === :herm ? conj(A[i, j]) : A[i, j]
+                end
+            end
+            kk += n - j + 1
+        end
+    end
+    return A
+end
+
+# spmv / hpmv shims.
+for (jname, sym, T) in (
+        (:sspmv, :sspmv_, Float32),    (:dspmv, :dspmv_, Float64),
+        (:chpmv, :chpmv_, ComplexF32), (:zhpmv, :zhpmv_, ComplexF64),
+    )
+    @eval function $jname(handle, uplo::Char, n::Int, α::$T,
+                          AP::AbstractVector{$T},
+                          x::AbstractVector{$T}, incx::Int,
+                          β::$T, y::AbstractVector{$T}, incy::Int)
+        ptr = Libdl.dlsym(handle, $(QuoteNode(sym)))
+        ccall(ptr, Cvoid,
+              (Ref{UInt8}, Ref{BlasInt},
+               Ref{$T}, Ptr{$T},
+               Ptr{$T}, Ref{BlasInt},
+               Ref{$T}, Ptr{$T}, Ref{BlasInt}, Csize_t),
+              UInt8(uplo), BlasInt(n),
+              α, AP,
+              x, BlasInt(incx),
+              β, y, BlasInt(incy), Csize_t(1))
+        return y
+    end
+end
+
+# spr / hpr shims (hpr takes real α).
+for (jname, sym, T) in ((:sspr, :sspr_, Float32),
+                         (:dspr, :dspr_, Float64))
+    @eval function $jname(handle, uplo::Char, n::Int, α::$T,
+                          x::AbstractVector{$T}, incx::Int,
+                          AP::AbstractVector{$T})
+        ptr = Libdl.dlsym(handle, $(QuoteNode(sym)))
+        ccall(ptr, Cvoid,
+              (Ref{UInt8}, Ref{BlasInt},
+               Ref{$T}, Ptr{$T}, Ref{BlasInt},
+               Ptr{$T}, Csize_t),
+              UInt8(uplo), BlasInt(n),
+              α, x, BlasInt(incx),
+              AP, Csize_t(1))
+        return AP
+    end
+end
+
+for (jname, sym, T, TR) in ((:chpr, :chpr_, ComplexF32, Float32),
+                             (:zhpr, :zhpr_, ComplexF64, Float64))
+    @eval function $jname(handle, uplo::Char, n::Int, α::$TR,
+                          x::AbstractVector{$T}, incx::Int,
+                          AP::AbstractVector{$T})
+        ptr = Libdl.dlsym(handle, $(QuoteNode(sym)))
+        ccall(ptr, Cvoid,
+              (Ref{UInt8}, Ref{BlasInt},
+               Ref{$TR}, Ptr{$T}, Ref{BlasInt},
+               Ptr{$T}, Csize_t),
+              UInt8(uplo), BlasInt(n),
+              α, x, BlasInt(incx),
+              AP, Csize_t(1))
+        return AP
+    end
+end
+
+# spr2 / hpr2 shims.
+for (jname, sym, T) in (
+        (:sspr2, :sspr2_, Float32),    (:dspr2, :dspr2_, Float64),
+        (:chpr2, :chpr2_, ComplexF32), (:zhpr2, :zhpr2_, ComplexF64),
+    )
+    @eval function $jname(handle, uplo::Char, n::Int, α::$T,
+                          x::AbstractVector{$T}, incx::Int,
+                          y::AbstractVector{$T}, incy::Int,
+                          AP::AbstractVector{$T})
+        ptr = Libdl.dlsym(handle, $(QuoteNode(sym)))
+        ccall(ptr, Cvoid,
+              (Ref{UInt8}, Ref{BlasInt},
+               Ref{$T}, Ptr{$T}, Ref{BlasInt},
+               Ptr{$T}, Ref{BlasInt},
+               Ptr{$T}, Csize_t),
+              UInt8(uplo), BlasInt(n),
+              α, x, BlasInt(incx),
+              y, BlasInt(incy),
+              AP, Csize_t(1))
+        return AP
+    end
+end
+
+# tpmv / tpsv shims.
+for (jname, sym, T) in (
+        (:stpmv, :stpmv_, Float32),    (:dtpmv, :dtpmv_, Float64),
+        (:ctpmv, :ctpmv_, ComplexF32), (:ztpmv, :ztpmv_, ComplexF64),
+        (:stpsv, :stpsv_, Float32),    (:dtpsv, :dtpsv_, Float64),
+        (:ctpsv, :ctpsv_, ComplexF32), (:ztpsv, :ztpsv_, ComplexF64),
+    )
+    @eval function $jname(handle, uplo::Char, trans::Char, diag::Char,
+                          n::Int, AP::AbstractVector{$T},
+                          x::AbstractVector{$T}, incx::Int)
+        ptr = Libdl.dlsym(handle, $(QuoteNode(sym)))
+        ccall(ptr, Cvoid,
+              (Ref{UInt8}, Ref{UInt8}, Ref{UInt8}, Ref{BlasInt},
+               Ptr{$T}, Ptr{$T}, Ref{BlasInt},
+               Csize_t, Csize_t, Csize_t),
+              UInt8(uplo), UInt8(trans), UInt8(diag), BlasInt(n),
+              AP, x, BlasInt(incx),
+              Csize_t(1), Csize_t(1), Csize_t(1))
+        return x
+    end
+end
+
 function run_blas1_tests(handle, rng)
     @testset "BLAS Level 1" begin
         # ── axpy (y := α·x + y) ──
@@ -1096,6 +1426,310 @@ function run_blas2_tests(handle, rng)
                         if lda > n
                             @test Astor[n+1:lda, :] == Astor0[n+1:lda, :]
                         end
+                    end
+                end
+            end
+        end
+
+        # ── spmv / hpmv (symmetric / Hermitian packed) ──
+        @testset "spmv / hpmv" begin
+            n_sweep = [1, 4, 17]
+            for (jcall, T, herm, atol) in (
+                    (sspmv, Float32,    false, 1f-4),
+                    (dspmv, Float64,    false, 1e-11),
+                    (chpmv, ComplexF32, true,  1f-4),
+                    (zhpmv, ComplexF64, true,  1e-11),
+                )
+                @testset "$(nameof(jcall)) $T" begin
+                    α = make_alpha(T); β = make_beta(T)
+                    for n in n_sweep, uplo in ('U', 'L'),
+                        (incx, incy) in VEC_INCS
+                        # Build random dense A; force Hermitian invariant.
+                        A_dense = randn(rng, T, n, n)
+                        if herm
+                            for i in 1:n
+                                A_dense[i, i] = real(A_dense[i, i])
+                                for k in i+1:n
+                                    A_dense[i, k] = conj(A_dense[k, i])
+                                end
+                            end
+                        else
+                            A_dense = (A_dense .+ transpose(A_dense)) ./ T(2)
+                        end
+                        AP = uplo == 'U' ? dense_to_packed_U(A_dense) :
+                                            dense_to_packed_L(A_dense)
+                        AP0 = copy(AP)
+
+                        x = rand_vec(T, n, rng)
+                        y = rand_vec(T, n, rng)
+                        xbuf = strided_buffer(x, incx)
+                        ybuf = strided_buffer(y, incy)
+
+                        jcall(handle, uplo, n, α, AP, xbuf, incx, β, ybuf, incy)
+
+                        Aview = herm ? Hermitian(A_dense, uplo == 'U' ? :U : :L) :
+                                       Symmetric(A_dense, uplo == 'U' ? :U : :L)
+                        y_ref = α .* (Aview * x) .+ β .* y
+                        @test isapprox(extract_strided(ybuf, n, incy), y_ref;
+                                       atol = atol * max(1, n * n))
+                        @test AP == AP0  # routine must not write to AP
+                    end
+                end
+            end
+        end
+
+        # ── spr / hpr (symmetric / Hermitian packed rank-1) ──
+        @testset "spr / hpr" begin
+            n_sweep = [1, 4, 17]
+            for (jcall, T, herm, αval, atol) in (
+                    (sspr, Float32,    false, 0.7f0, 1f-5),
+                    (dspr, Float64,    false, 0.7,   1e-12),
+                    (chpr, ComplexF32, true,  0.7f0, 1f-5),
+                    (zhpr, ComplexF64, true,  0.7,   1e-12),
+                )
+                @testset "$(nameof(jcall)) $T" begin
+                    for n in n_sweep, uplo in ('U', 'L'), incx in (1, 2, -1)
+                        A_dense = randn(rng, T, n, n)
+                        if herm
+                            for i in 1:n
+                                A_dense[i, i] = real(A_dense[i, i])
+                            end
+                        end
+                        AP = uplo == 'U' ? dense_to_packed_U(A_dense) :
+                                            dense_to_packed_L(A_dense)
+                        x = rand_vec(T, n, rng)
+                        xbuf = strided_buffer(x, incx)
+
+                        jcall(handle, uplo, n, αval, xbuf, incx, AP)
+
+                        # Reference: build expected packed via dense update.
+                        ker = herm ? αval .* (x * x') : αval .* (x * transpose(x))
+                        A_expect = copy(A_dense)
+                        for j in 1:n, i in (uplo == 'U' ? (1:j) : (j:n))
+                            A_expect[i, j] += ker[i, j]
+                            if herm && i == j
+                                A_expect[i, j] = real(A_expect[i, j])
+                            end
+                        end
+                        AP_expect = uplo == 'U' ? dense_to_packed_U(A_expect) :
+                                                   dense_to_packed_L(A_expect)
+                        @test isapprox(AP, AP_expect; atol = atol * max(1, n))
+                    end
+                end
+            end
+        end
+
+        # ── spr2 / hpr2 (symmetric / Hermitian packed rank-2) ──
+        @testset "spr2 / hpr2" begin
+            n_sweep = [1, 4, 17]
+            for (jcall, T, herm, atol) in (
+                    (sspr2, Float32,    false, 1f-5),
+                    (dspr2, Float64,    false, 1e-12),
+                    (chpr2, ComplexF32, true,  1f-5),
+                    (zhpr2, ComplexF64, true,  1e-12),
+                )
+                @testset "$(nameof(jcall)) $T" begin
+                    α = make_alpha(T)
+                    for n in n_sweep, uplo in ('U', 'L'), (incx, incy) in VEC_INCS
+                        A_dense = randn(rng, T, n, n)
+                        if herm
+                            for i in 1:n
+                                A_dense[i, i] = real(A_dense[i, i])
+                            end
+                        end
+                        AP = uplo == 'U' ? dense_to_packed_U(A_dense) :
+                                            dense_to_packed_L(A_dense)
+                        x = rand_vec(T, n, rng)
+                        y = rand_vec(T, n, rng)
+                        xbuf = strided_buffer(x, incx)
+                        ybuf = strided_buffer(y, incy)
+
+                        jcall(handle, uplo, n, α, xbuf, incx, ybuf, incy, AP)
+
+                        ker = herm ?
+                            (α .* (x * y') .+ conj(α) .* (y * x')) :
+                            (α .* (x * transpose(y)) .+ α .* (y * transpose(x)))
+                        A_expect = copy(A_dense)
+                        for j in 1:n, i in (uplo == 'U' ? (1:j) : (j:n))
+                            A_expect[i, j] += ker[i, j]
+                            if herm && i == j
+                                A_expect[i, j] = real(A_expect[i, j])
+                            end
+                        end
+                        AP_expect = uplo == 'U' ? dense_to_packed_U(A_expect) :
+                                                   dense_to_packed_L(A_expect)
+                        @test isapprox(AP, AP_expect; atol = atol * max(1, n))
+                    end
+                end
+            end
+        end
+
+        # ── tpmv / tpsv (triangular packed) ──
+        @testset "tpmv / tpsv" begin
+            n_sweep = [1, 5, 16]
+            for (jcall_mv, jcall_sv, T, atol_mv, atol_sv) in (
+                    (stpmv, stpsv, Float32,    1f-4, 1f-3),
+                    (dtpmv, dtpsv, Float64,    1e-11, 1e-10),
+                    (ctpmv, ctpsv, ComplexF32, 1f-4, 1f-3),
+                    (ztpmv, ztpsv, ComplexF64, 1e-11, 1e-10),
+                )
+                trset = T <: Complex ? CPLX_TR : REAL_TR
+                @testset "$(nameof(jcall_mv)) / $(nameof(jcall_sv)) $T" begin
+                    for n in n_sweep, uplo in ('U', 'L'),
+                        trans in trset, diag_c in ('N', 'U'), incx in (1, 2, -1)
+                        # Diagonally-dominant random tri matrix → stable tpsv.
+                        A_dense = randn(rng, T, n, n) ./ T(n) .+
+                                  Matrix{T}(T(1) * I, n, n)
+                        AP = uplo == 'U' ? dense_to_packed_U(A_dense) :
+                                            dense_to_packed_L(A_dense)
+                        AP0 = copy(AP)
+
+                        Atri = if uplo == 'U'
+                            diag_c == 'U' ? UnitUpperTriangular(A_dense) :
+                                            UpperTriangular(A_dense)
+                        else
+                            diag_c == 'U' ? UnitLowerTriangular(A_dense) :
+                                            LowerTriangular(A_dense)
+                        end
+                        Aop = trans == 'N' ? Atri :
+                              trans == 'T' ? transpose(Atri) : adjoint(Atri)
+
+                        # tpmv
+                        x = rand_vec(T, n, rng)
+                        xbuf = strided_buffer(x, incx)
+                        jcall_mv(handle, uplo, trans, diag_c, n, AP, xbuf, incx)
+                        @test isapprox(extract_strided(xbuf, n, incx), Aop * x;
+                                       atol = atol_mv * max(1, n))
+                        @test AP == AP0  # AP unchanged
+
+                        # tpsv
+                        b = rand_vec(T, n, rng)
+                        bbuf = strided_buffer(b, incx)
+                        jcall_sv(handle, uplo, trans, diag_c, n, AP, bbuf, incx)
+                        @test isapprox(extract_strided(bbuf, n, incx), Aop \ b;
+                                       atol = atol_sv * max(1, n))
+                        @test AP == AP0
+                    end
+                end
+            end
+        end
+
+        # ── gbmv (general band) ──
+        @testset "gbmv" begin
+            n_sweep = [1, 5, 16]
+            band_sweep = [(0,0), (1,0), (0,1), (1,2), (2,3)]
+            for (jcall, T, atol) in (
+                    (sgbmv, Float32,    1f-4),
+                    (dgbmv, Float64,    1e-11),
+                    (cgbmv, ComplexF32, 1f-4),
+                    (zgbmv, ComplexF64, 1e-11),
+                )
+                trset = T <: Complex ? CPLX_TR : REAL_TR
+                @testset "$(nameof(jcall)) $T" begin
+                    α = make_alpha(T); β = make_beta(T)
+                    for n in n_sweep, m in (n, n + 2),
+                        (kl, ku) in band_sweep, trans in trset,
+                        (incx, incy) in VEC_INCS
+                        kl_eff = min(kl, m - 1 < 0 ? 0 : m - 1)
+                        ku_eff = min(ku, n - 1 < 0 ? 0 : n - 1)
+                        lda = kl_eff + ku_eff + 1
+                        A_dense = rand_band_dense(T, m, n, kl_eff, ku_eff, rng)
+                        AB = dense_to_gb(A_dense, kl_eff, ku_eff, lda)
+
+                        xlen, ylen = (trans == 'N') ? (n, m) : (m, n)
+                        x = rand_vec(T, xlen, rng)
+                        y = rand_vec(T, ylen, rng)
+                        xbuf = strided_buffer(x, incx)
+                        ybuf = strided_buffer(y, incy)
+
+                        jcall(handle, trans, m, n, kl_eff, ku_eff, α,
+                              AB, lda, xbuf, incx, β, ybuf, incy)
+
+                        op = trans == 'N' ? A_dense :
+                             trans == 'T' ? transpose(A_dense) : adjoint(A_dense)
+                        y_ref = α .* (op * x) .+ β .* y
+                        @test isapprox(extract_strided(ybuf, ylen, incy), y_ref;
+                                       atol = atol * max(1, m * n))
+                    end
+                end
+            end
+        end
+
+        # ── sbmv / hbmv (symmetric / Hermitian band) ──
+        @testset "sbmv / hbmv" begin
+            n_sweep = [1, 5, 16]
+            for (jcall, T, herm, atol) in (
+                    (ssbmv, Float32,    false, 1f-4),
+                    (dsbmv, Float64,    false, 1e-11),
+                    (chbmv, ComplexF32, true,  1f-4),
+                    (zhbmv, ComplexF64, true,  1e-11),
+                )
+                @testset "$(nameof(jcall)) $T" begin
+                    α = make_alpha(T); β = make_beta(T)
+                    for n in n_sweep, k in 0:min(3, n - 1),
+                        uplo in ('U', 'L'), (incx, incy) in VEC_INCS
+                        lda = k + 1
+                        A_dense = herm ? rand_herm_band_dense(T, n, k, rng) :
+                                          rand_sym_band_dense(T, n, k, rng)
+                        AB = uplo == 'U' ? dense_to_band_U(A_dense, k, lda) :
+                                            dense_to_band_L(A_dense, k, lda)
+                        x = rand_vec(T, n, rng)
+                        y = rand_vec(T, n, rng)
+                        xbuf = strided_buffer(x, incx)
+                        ybuf = strided_buffer(y, incy)
+
+                        jcall(handle, uplo, n, k, α, AB, lda,
+                              xbuf, incx, β, ybuf, incy)
+
+                        y_ref = α .* (A_dense * x) .+ β .* y
+                        @test isapprox(extract_strided(ybuf, n, incy), y_ref;
+                                       atol = atol * max(1, n * (k + 1)))
+                    end
+                end
+            end
+        end
+
+        # ── tbmv / tbsv (triangular band) ──
+        @testset "tbmv / tbsv" begin
+            n_sweep = [1, 5, 16]
+            for (jcall_mv, jcall_sv, T, atol_mv, atol_sv) in (
+                    (stbmv, stbsv, Float32,    1f-4, 1f-3),
+                    (dtbmv, dtbsv, Float64,    1e-11, 1e-10),
+                    (ctbmv, ctbsv, ComplexF32, 1f-4, 1f-3),
+                    (ztbmv, ztbsv, ComplexF64, 1e-11, 1e-10),
+                )
+                trset = T <: Complex ? CPLX_TR : REAL_TR
+                @testset "$(nameof(jcall_mv)) / $(nameof(jcall_sv)) $T" begin
+                    for n in n_sweep, k in 0:min(3, n - 1),
+                        uplo in ('U', 'L'), trans in trset,
+                        diag_c in ('N', 'U'), incx in (1, 2, -1)
+                        lda = k + 1
+                        A_dense = rand_tri_band_dense(T, n, k, uplo, rng)
+                        AB = uplo == 'U' ? dense_to_band_U(A_dense, k, lda) :
+                                            dense_to_band_L(A_dense, k, lda)
+                        Atri = if uplo == 'U'
+                            diag_c == 'U' ? UnitUpperTriangular(A_dense) :
+                                            UpperTriangular(A_dense)
+                        else
+                            diag_c == 'U' ? UnitLowerTriangular(A_dense) :
+                                            LowerTriangular(A_dense)
+                        end
+                        Aop = trans == 'N' ? Atri :
+                              trans == 'T' ? transpose(Atri) : adjoint(Atri)
+
+                        # tbmv
+                        x = rand_vec(T, n, rng)
+                        xbuf = strided_buffer(x, incx)
+                        jcall_mv(handle, uplo, trans, diag_c, n, k, AB, lda, xbuf, incx)
+                        @test isapprox(extract_strided(xbuf, n, incx), Aop * x;
+                                       atol = atol_mv * max(1, n * (k + 1)))
+
+                        # tbsv
+                        b = rand_vec(T, n, rng)
+                        bbuf = strided_buffer(b, incx)
+                        jcall_sv(handle, uplo, trans, diag_c, n, k, AB, lda, bbuf, incx)
+                        @test isapprox(extract_strided(bbuf, n, incx), Aop \ b;
+                                       atol = atol_sv * max(1, n * (k + 1)))
                     end
                 end
             end

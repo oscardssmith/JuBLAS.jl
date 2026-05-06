@@ -4,9 +4,11 @@ version = "1.0.0"
 authors = ["Oscar Smith <oscar.smith@juliahub.com>"]
 
 [deps]
+CpuId = "adafc99b-e345-5852-983c-f28acb93d879"
 
 [compat]
 BenchmarkTools = "1.8.0"
+CpuId = "0.3"
 LinearAlgebra = "1.12.0"
 Printf = "1.11.0"
 Random = "1.11.0"

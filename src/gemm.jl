@@ -152,45 +152,127 @@ nr(::ScalarKernel{MR,NR}) where {MR,NR}             = NR
 mr(::SIMDKernel{W,MR,NR,T}) where {W,MR,NR,T}       = MR
 nr(::SIMDKernel{W,MR,NR,T}) where {W,MR,NR,T}       = NR
 
-default_kernel(::Type{Float64}) = SIMDKernel{8,   8, 24, Float64}()
-default_kernel(::Type{Float32}) = SIMDKernel{16, 16, 24, Float32}()
-default_kernel(::Type{T}) where {T} = ScalarKernel{8,6}()
+# Runtime CPU detection. Each call issues CPUID and parses the result —
+# ~hundreds of cycles, run a handful of times per `gemm!` call, lost in
+# the noise of a millisecond-scale matmul. CpuId is x86-only and may throw
+# on hypervisors that hide cache info; fall back to Skylake-class defaults.
+function _cache_sizes()
+    try
+        cs = CpuId.cachesize()
+        l1 = length(cs) >= 1 && cs[1] > 0 ? Int(cs[1]) : 32 * 1024
+        l2 = length(cs) >= 2 && cs[2] > 0 ? Int(cs[2]) : 1024 * 1024
+        l3 = length(cs) >= 3 && cs[3] > 0 ? Int(cs[3]) : 16 * 1024 * 1024
+        return (l1, l2, l3)
+    catch
+        return (32 * 1024, 1024 * 1024, 16 * 1024 * 1024)
+    end
+end
+_simd_bytes() = try; Int(CpuId.simdbytes()); catch; 0; end
+
+# Pick the strongest microkernel the host CPU can run. AVX-512 (zmm, 64 B),
+# then AVX2 (ymm, 32 B), then SSE2 (xmm, 16 B), else scalar. The MR×NR shapes
+# come from the bench sweep — these are the configs that consistently won on
+# Skylake-class hardware.
+function default_kernel(::Type{Float64})
+    sb = _simd_bytes()
+    sb >= 64 ? SIMDKernel{8, 16, 14, Float64}() :
+    sb >= 32 ? SIMDKernel{4,  8,  6, Float64}() :
+    sb >= 16 ? SIMDKernel{2,  2,  4, Float64}() :
+               ScalarKernel{8, 6}()
+end
+function default_kernel(::Type{Float32})
+    sb = _simd_bytes()
+    sb >= 64 ? SIMDKernel{16, 32, 14, Float32}() :
+    sb >= 32 ? SIMDKernel{8,  16,  6, Float32}() :
+    sb >= 16 ? SIMDKernel{4,   4,  6, Float32}() :
+               ScalarKernel{16, 6}()
+end
+default_kernel(::Type{T}) where {T} = ScalarKernel{8, 6}()
 
 # ─── Block sizes (per-kernel traits) ──────────────────────────────────────
 #
 # `mc_block`: rows of A panel held in L2. Must be a multiple of MR so the
 #             macrokernel's ir-loop has no edge panels in the common case.
-# `kc_block`: depth of A/B panels. For SIMD kernels we cap KC so the B
-#             micropanel (NR × KC × sizeof(T)) fits in L1d alongside the A
-#             micropanel; ~28 KiB target leaves headroom in a 32 KiB L1.
-# `nc_block`: width of B slab held in L3. 4080 is divisible by 6, 14, 24.
+# `kc_block`: depth of A/B panels. For SIMD kernels we size KC so the B
+#             micropanel (NR × KC × T) lives in L1d (A is streamed).
+# `nc_block`: width of B slab held in L3.
+
+# Each `*_block` method takes a `(L1d, L2, L3)` cache-size tuple. Callers
+# (`gemm!`, `gemm_workspace`) query `_cache_sizes()` once and thread the
+# tuple through, so a single `gemm!` call costs one CpuId trip.
 #
-# Override these for new kernel shapes if you care about boundary edges or
-# L1 capacity on a specific microarch.
+# ScalarKernel / AbstractKernel fallback: no cache-aware tuning — used only
+# for the non-strided-C path, which isn't perf-critical.
+mc_block(k::AbstractKernel, _caches=_cache_sizes()) = cld(72, mr(k)) * mr(k)
+kc_block(::AbstractKernel,  _caches=_cache_sizes()) = 256
+nc_block(::AbstractKernel,  _caches=_cache_sizes()) = 4080
 
-mc_block(k::AbstractKernel) = cld(72, mr(k)) * mr(k)   # round up to multiple of MR
-kc_block(::AbstractKernel)  = 256
-nc_block(::AbstractKernel)  = 4080
+# SIMDKernel block sizes follow the Goto/BLIS cache hierarchy:
+#
+#   KC: B micropanel (NR × KC × T) is hot in L1d throughout one macrokernel
+#       call (reused across MC/MR ir-iterations). A is *streamed* one
+#       column-of-MR per k-iter, so only a few A cache lines are hot at any
+#       moment — we don't budget the full A microtile against L1d. Take 3/4
+#       of L1d to leave room for the streamed A lines, stack, and writeback.
+#
+#   MC: A panel (MC × KC × T) is hot in L2 across all NR-stride steps of the
+#       jr loop. Budget half of L2, leaving room for the B slab to coexist
+#       (it also funnels through L2 from L3) and for system noise.
+#
+#   NC: B slab (KC × NC × T) is hot in L3 across all MC-stride steps of the
+#       ic loop. Budget half of L3 to share with A and any co-runners.
+#
+# Each block is rounded to be a clean multiple of the relevant register
+# tile dimension so the macrokernel's loops have no edge in the bulk case.
 
-# SIMD kernels: scale MC so the A micropanel byte budget (~MC × KC × sizeof(T))
-# stays L2-resident. Reference point: Float64 MR=8 → MC=72 (BLIS dgemm skx default).
-# For Float32 the same byte budget gives MC=144; matches BLIS sgemm skx default.
-function mc_block(::SIMDKernel{W,MR,NR,T}) where {W,MR,NR,T}
-    target_mc = (72 * 8) ÷ sizeof(T)
+function kc_block(::SIMDKernel{W,MR,NR,T}, caches=_cache_sizes()) where {W,MR,NR,T}
+    l1 = caches[1]
+    budget = (l1 * 3) ÷ 4
+    raw    = budget ÷ (NR * sizeof(T))
+    return clamp(raw - raw % 8, 64, 512)
+end
+
+function mc_block(k::SIMDKernel{W,MR,NR,T}, caches=_cache_sizes()) where {W,MR,NR,T}
+    kc        = kc_block(k, caches)
+    l2        = caches[2]
+    target_mc = max((l2 ÷ 2) ÷ (kc * sizeof(T)), MR)
     return cld(target_mc, MR) * MR
 end
 
-# SIMD kernels: cap KC so the B micropanel (NR × KC × sizeof(T)) fits in L1.
-function kc_block(::SIMDKernel{W,MR,NR,T}) where {W,MR,NR,T}
-    raw = (28 * 1024) ÷ (NR * sizeof(T))
-    return clamp(raw - raw % 8, 64, 256)
+function nc_block(k::SIMDKernel{W,MR,NR,T}, caches=_cache_sizes()) where {W,MR,NR,T}
+    kc        = kc_block(k, caches)
+    l3        = caches[3]
+    target_nc = max((l3 ÷ 2) ÷ (kc * sizeof(T)), NR)
+    return (target_nc ÷ NR) * NR
 end
 
 # ─── Main entry point ─────────────────────────────────────────────────────
 
+"""
+    gemm_workspace(::Type{T}, kernel) -> (Apack, Bpack)
+
+Allocate the pack buffers a `kernel`-shaped `gemm!` call needs. Pass them
+back via the `Apack`/`Bpack` keywords to amortize allocation across many
+calls and keep the buffers warm in cache. Sized for the kernel's full
+block dimensions (`MC×KC` for A, `NC×KC` for B); the same buffers are valid
+for any problem size that fits.
+"""
+function gemm_workspace(::Type{T}, kernel::AbstractKernel) where {T}
+    MR_ = mr(kernel); NR_ = nr(kernel)
+    caches = _cache_sizes()
+    MC_ = mc_block(kernel, caches)
+    KC_ = kc_block(kernel, caches)
+    NC_ = nc_block(kernel, caches)
+    Apack = Vector{T}(undef, cld(MC_, MR_) * MR_ * KC_)
+    Bpack = Vector{T}(undef, cld(NC_, NR_) * NR_ * KC_)
+    return (Apack, Bpack)
+end
+
 function gemm!(C::AbstractMatrix{T}, A::AbstractMatrix{T}, B::AbstractMatrix{T},
                α = true, β = false;
-               kernel::AbstractKernel = default_kernel(T)) where {T}
+               kernel::AbstractKernel = default_kernel(T),
+               Apack::Union{Vector{T},Nothing} = nothing,
+               Bpack::Union{Vector{T},Nothing} = nothing) where {T}
     M, N = size(C)
     size(A, 1) == M           || throw(DimensionMismatch("size(A,1) ≠ size(C,1)"))
     size(B, 2) == N           || throw(DimensionMismatch("size(B,2) ≠ size(C,2)"))
@@ -202,15 +284,22 @@ function gemm!(C::AbstractMatrix{T}, A::AbstractMatrix{T}, B::AbstractMatrix{T},
 
     MR_ = mr(kernel)
     NR_ = nr(kernel)
-    MC_ = mc_block(kernel)
-    KC_ = kc_block(kernel)
-    NC_ = nc_block(kernel)
+    caches = _cache_sizes()
+    MC_ = mc_block(kernel, caches)
+    KC_ = kc_block(kernel, caches)
+    NC_ = nc_block(kernel, caches)
 
     mc_max = min(MC_, M)
     kc_max = min(KC_, K)
     nc_max = min(NC_, N)
-    Apack = Vector{T}(undef, cld(mc_max, MR_) * MR_ * kc_max)
-    Bpack = Vector{T}(undef, cld(nc_max, NR_) * NR_ * kc_max)
+    apack_sz = cld(mc_max, MR_) * MR_ * kc_max
+    bpack_sz = cld(nc_max, NR_) * NR_ * kc_max
+    Apack === nothing && (Apack = Vector{T}(undef, apack_sz))
+    Bpack === nothing && (Bpack = Vector{T}(undef, bpack_sz))
+    length(Apack) >= apack_sz ||
+        throw(ArgumentError("Apack too small: have $(length(Apack)), need $apack_sz"))
+    length(Bpack) >= bpack_sz ||
+        throw(ArgumentError("Bpack too small: have $(length(Bpack)), need $bpack_sz"))
     αT    = convert(T, α)
 
     @inbounds for jc in 1:NC_:N
@@ -286,35 +375,54 @@ end
     end
 end
 
-# Same fast/slow split as `_pack_A!`. The inner copy here is stride-`ldB`
-# (varying column of column-major B), so LLVM can't fold it into one
-# vector load — but unrolling avoids versioning + memcheck overhead and
-# lets the loads/stores schedule cleanly.
+# Pointer-based packing for B with the LLVM loop vectorizer **disabled** on
+# the inner k-loops. Without that hint, LLVM vectorizes across k iterations:
+# loads end up contiguous (good) but stores get a stride of `NR*sizeof(T)`
+# (= 112 B for Float64, NR=14), forcing `vscatterqpd` that loses badly. The
+# vectorizer also versions the loop with O(NR²) pairwise alias checks,
+# blowing the GPR budget and causing ~50 spills/reloads in the prologue.
+# With vectorization off, the fast path becomes a clean walking-pointer
+# loop: 14× `vmovsd` load + 14× `vmovsd` store per k, no scatter, no
+# memcheck, no scratch-stack churn.
 @generated function _pack_B!(Bpack::Vector{T}, B::AbstractMatrix{T},
                               pc::Int, jc::Int, kc::Int, nc::Int,
                               ::Val{NR}) where {T,NR}
-    fast_copy = [:( Bpack[base + $j] = B[pc + k, jc + cs + $(j-1)] ) for j in 1:NR]
+    sz = sizeof(T)
+    fast_copy = [:( unsafe_store!(pBp, unsafe_load(pB + ($(j-1)) * ldB_b), $j) ) for j in 1:NR]
+    novec = Expr(:loopinfo, (Symbol("llvm.loop.vectorize.enable"), false))
     quote
         $(Expr(:meta, :inline))
         z = zero($T)
         npanels = cld(nc, $NR)
-        @inbounds for p in 0:npanels-1
-            cs   = p * $NR
-            cmax = min($NR, nc - cs)
-            base_panel = p * $NR * kc
-            if cmax == $NR
-                for k in 0:kc-1
-                    base = base_panel + k * $NR
-                    $(fast_copy...)
-                end
-            else
-                for k in 0:kc-1
-                    base = base_panel + k * $NR
-                    for j in 1:cmax
-                        Bpack[base + j] = B[pc + k, jc + cs + j - 1]
+        GC.@preserve Bpack B begin
+            pBp0 = pointer(Bpack)
+            pB0  = pointer(B)
+            ldB  = stride(B, 2)
+            ldB_b = ldB * $sz
+            @inbounds for p in 0:npanels-1
+                cs   = p * $NR
+                cmax = min($NR, nc - cs)
+                base_panel = p * $NR * kc
+                col_off_b = ((pc - 1) + (jc + cs - 1) * ldB) * $sz
+                if cmax == $NR
+                    for k in 0:kc-1
+                        pB  = pB0  + col_off_b + k * $sz
+                        pBp = pBp0 + (base_panel + k * $NR) * $sz
+                        $(fast_copy...)
+                        $novec
                     end
-                    for j in cmax+1:$NR
-                        Bpack[base + j] = z
+                else
+                    for k in 0:kc-1
+                        base = base_panel + k * $NR
+                        for j in 1:cmax
+                            Bpack[base + j] = B[pc + k, jc + cs + j - 1]
+                            $novec
+                        end
+                        for j in cmax+1:$NR
+                            Bpack[base + j] = z
+                            $novec
+                        end
+                        $novec
                     end
                 end
             end
@@ -332,10 +440,10 @@ function _macrokernel!(kernel::AbstractKernel, C::AbstractMatrix{T},
     NR_ = nr(kernel)
     @inbounds for jr in 0:NR_:nc-1
         nr_ = min(NR_, nc - jr)
-        bo = (jr ÷ NR_) * NR_ * kc
+        bo = jr * kc
         for ir in 0:MR_:mc-1
             mr_ = min(MR_, mc - ir)
-            ao = (ir ÷ MR_) * MR_ * kc
+            ao = ir * kc
             ci = ic + ir
             cj = jc + jr
             if mr_ == MR_ && nr_ == NR_
@@ -445,36 +553,69 @@ end
         end
     end
 
-    # Vector writeback (full tile). `pC`/`ldc` extracted once outside.
+    # Vector writeback (full tile). `pC`/`ldc` extracted once outside; the
+    # column address is walked with `pCj += ldc*sz` instead of recomputing
+    # `(cj+j-1)*ldc*sz` per column. Otherwise the macrokernel hoists NR
+    # column indices out of the ir-loop and spills them all to the stack
+    # (only 16 GPRs), then reloads each one for an `imul` per column.
     write_full = Expr[]
-    for j in 1:NR, r in 1:rows
-        c    = Symbol("c_", r, "_", j)
-        roff = (r - 1) * W
-        push!(write_full, quote
-            let off = ((cj + $(j-1) - 1) * ldc + (ci + $roff - 1)) * $sz
-                _vstore!(pC + off, _vfma(αv, $c, _vload($Vty, pC + off)))
-            end
-        end)
+    push!(write_full, :( col_stride_b = ldc * $sz ))
+    push!(write_full, :( pCj = pC + ((cj - 1) * ldc + (ci - 1)) * $sz ))
+    for j in 1:NR
+        for r in 1:rows
+            c    = Symbol("c_", r, "_", j)
+            roff = (r - 1) * W
+            poff = roff * sz
+            p    = poff == 0 ? :pCj : :( pCj + $poff )
+            push!(write_full, quote
+                let p = $p
+                    _vstore!(p, _vfma(αv, $c, _vload($Vty, p)))
+                end
+            end)
+        end
+        if j < NR
+            push!(write_full, :( pCj = pCj + col_stride_b ))
+        end
     end
 
-    # Masked vector edge writeback. For each (r,j) we conditionally store the
-    # accumulator with a row-mask derived from `mr_`; columns past `nr_` are
-    # skipped at compile time (the `j <= nr_` check has `j` as a literal).
+    # Masked vector edge writeback. Same pCj walk as the full-tile path, plus
+    # the row-mask is hoisted (depends only on `mr_` and row group `r`, not
+    # on `j`). Columns past `nr_` are skipped at runtime via the
+    # compile-time-literal `j <= nr_` check; pCj is still advanced through
+    # the skipped columns (cheap and lets LLVM keep one rolling register).
     write_edge = Expr[]
-    for j in 1:NR, r in 1:rows
-        c    = Symbol("c_", r, "_", j)
-        roff = (r - 1) * W
-        push!(write_edge, quote
-            if $j <= nr_
-                let off  = ((cj + $(j-1) - 1) * ldc + (ci + $roff - 1)) * $sz,
-                    mask = _row_mask(mr_ - $roff, Val($W))
-                    if mask != UInt(0)
-                        cur = _vmaskedload($Vty, pC + off, mask)
-                        _vmaskedstore!(pC + off, _vfma(αv, $c, cur), mask)
+    for r in 1:rows
+        roff   = (r - 1) * W
+        mask_r = Symbol("mask_", r)
+        push!(write_edge, :( $mask_r = _row_mask(mr_ - $roff, Val($W)) ))
+    end
+    push!(write_edge, :( col_stride_b = ldc * $sz ))
+    push!(write_edge, :( pCj = pC + ((cj - 1) * ldc + (ci - 1)) * $sz ))
+    for j in 1:NR
+        body = Expr[]
+        for r in 1:rows
+            c      = Symbol("c_", r, "_", j)
+            mask_r = Symbol("mask_", r)
+            roff   = (r - 1) * W
+            poff   = roff * sz
+            p      = poff == 0 ? :pCj : :( pCj + $poff )
+            push!(body, quote
+                if $mask_r != UInt(0)
+                    let p = $p
+                        cur = _vmaskedload($Vty, p, $mask_r)
+                        _vmaskedstore!(p, _vfma(αv, $c, cur), $mask_r)
                     end
                 end
+            end)
+        end
+        push!(write_edge, quote
+            if $j <= nr_
+                $(body...)
             end
         end)
+        if j < NR
+            push!(write_edge, :( pCj = pCj + col_stride_b ))
+        end
     end
 
     quote

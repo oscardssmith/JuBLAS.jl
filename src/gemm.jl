@@ -159,6 +159,12 @@ end
 # With vectorization off, the fast path becomes a clean walking-pointer
 # loop: 14× `vmovsd` load + 14× `vmovsd` store per k, no scatter, no
 # memcheck, no scratch-stack churn.
+#
+# A column-major rewrite (outer j, inner linear k) was tried and ran
+# 1.78× slower per element: serializing the NR streams gave the OoO
+# engine fewer independent loads to pipeline, and the stride-NR stores
+# lost write-combining (each k iter touched a fresh cache line in
+# Bpack). Keep the row-major form.
 @generated function _pack_B!(Bpack::Vector{T}, B::AbstractMatrix{T},
                               pc::Int, jc::Int, kc::Int, nc::Int,
                               ::Val{NR}) where {T,NR}
@@ -205,6 +211,34 @@ end
         return Bpack
     end
 end
+
+# ─── Packing for transposed/adjoint inputs ────────────────────────────────
+#
+# `transpose(P)` flips the (M, K) axes (or (K, N) for B), so packing the
+# wrapped view through `_pack_A!` is structurally identical to packing
+# `P` through `_pack_B!` with the index roles swapped, and vice versa:
+#
+#   _pack_A!(buf, transpose(P), ic, pc, mc, kc, Val(MR))
+#       ≡ _pack_B!(buf, P, pc, ic, kc, mc, Val(MR))
+#   _pack_B!(buf, transpose(P), pc, jc, kc, nc, Val(NR))
+#       ≡ _pack_A!(buf, P, jc, pc, nc, kc, Val(NR))
+#
+# For `T<:Real`, `Adjoint` is bit-identical to `Transpose`, so a single
+# Union covers both. (Complex `Adjoint` needs conjugation during pack and
+# stays inline in `gemm_complex.jl`.)
+const _RealTransposed{T,P} = Union{Transpose{T,P}, Adjoint{T,P}}
+
+@inline _pack_A!(Apack::Vector{T},
+                 A::_RealTransposed{T, <:StridedMatrix{T}},
+                 ic::Int, pc::Int, mc::Int, kc::Int,
+                 v::Val) where {T<:Real} =
+    _pack_B!(Apack, parent(A), pc, ic, kc, mc, v)
+
+@inline _pack_B!(Bpack::Vector{T},
+                 B::_RealTransposed{T, <:StridedMatrix{T}},
+                 pc::Int, jc::Int, kc::Int, nc::Int,
+                 v::Val) where {T<:Real} =
+    _pack_A!(Bpack, parent(B), jc, pc, nc, kc, v)
 
 # ─── Macrokernel ──────────────────────────────────────────────────────────
 

@@ -149,6 +149,66 @@ end
     end
 end
 
+# ─── Packing for transposed/adjoint complex inputs ────────────────────────
+#
+# `Transpose` packs are role-swap forwards (same identity used in
+# `gemm.jl` for reals): packing `transpose(P)` as A is the same as
+# packing `P` as B with the indices swapped, and vice versa.
+#
+# `Adjoint` would do the same forward but additionally needs to conjugate
+# the imaginary sub-panels written to the pack buffer. We get that by
+# (1) packing through the Transpose path and (2) sign-flipping every Im
+# half of the resulting buffer. The pack buffer is roughly 2*MR*KC reals
+# (or 2*NR*KC) per panel and is touched once per macrokernel call, so a
+# second linear pass over it is dwarfed by the kc² FMA work in the
+# kernel. (Inlining the conjugation into a custom @generated method
+# would save this pass, but the saving is in the noise; reuse wins.)
+
+@inline _pack_A!(Apack::Vector{TR},
+                 A::Transpose{Complex{TR}, <:StridedMatrix{Complex{TR}}},
+                 ic::Int, pc::Int, mc::Int, kc::Int,
+                 v::Val) where {TR<:Real} =
+    _pack_B!(Apack, parent(A), pc, ic, kc, mc, v)
+
+@inline _pack_B!(Bpack::Vector{TR},
+                 B::Transpose{Complex{TR}, <:StridedMatrix{Complex{TR}}},
+                 pc::Int, jc::Int, kc::Int, nc::Int,
+                 v::Val) where {TR<:Real} =
+    _pack_A!(Bpack, parent(B), jc, pc, nc, kc, v)
+
+# Negate every Im half of a packed buffer with `npanels` panels, each panel
+# laid out as (Re k=0)(Im k=0)(Re k=1)(Im k=1)... with `lane` reals per half.
+@inline function _conj_im_panels!(buf::Vector{TR}, npanels::Int, lane::Int, kc::Int) where {TR<:Real}
+    @inbounds for p in 0:npanels-1
+        base = p * 2 * lane * kc
+        for k in 0:kc-1
+            base_im = base + k * 2 * lane + lane
+            for i in 1:lane
+                buf[base_im + i] = -buf[base_im + i]
+            end
+        end
+    end
+    return buf
+end
+
+@inline function _pack_A!(Apack::Vector{TR},
+                          A::Adjoint{Complex{TR}, <:StridedMatrix{Complex{TR}}},
+                          ic::Int, pc::Int, mc::Int, kc::Int,
+                          v::Val{MR}) where {TR<:Real, MR}
+    _pack_B!(Apack, parent(A), pc, ic, kc, mc, v)
+    _conj_im_panels!(Apack, cld(mc, MR), MR, kc)
+    return Apack
+end
+
+@inline function _pack_B!(Bpack::Vector{TR},
+                          B::Adjoint{Complex{TR}, <:StridedMatrix{Complex{TR}}},
+                          pc::Int, jc::Int, kc::Int, nc::Int,
+                          v::Val{NR}) where {TR<:Real, NR}
+    _pack_A!(Bpack, parent(B), jc, pc, nc, kc, v)
+    _conj_im_panels!(Bpack, cld(nc, NR), NR, kc)
+    return Bpack
+end
+
 # ─── Microkernel: complex SIMD ───────────────────────────────────────────
 # Inner loop per k:
 #   load   Are[r], Aim[r]                    (2 vec loads per row group)
@@ -321,7 +381,7 @@ end
 
 function gemm!(C::AbstractMatrix{Complex{TR}}, A::AbstractMatrix{Complex{TR}}, B::AbstractMatrix{Complex{TR}},
                α = true, β = false;
-               kernel::SIMDKernel{W,MR,NR,Complex{TR}} = default_complex_kernel(TR),
+               kernel::SIMDKernel{W,MR,NR,Complex{TR}} = default_kernel(Complex{TR}),
                Apack::Union{Vector{TR},Nothing} = nothing,
                Bpack::Union{Vector{TR},Nothing} = nothing) where {W,MR,NR,TR<:Real}
     M, N = size(C)

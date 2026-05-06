@@ -74,7 +74,7 @@ uuid = "692b3bcd-3c85-4b1f-b108-f13ce0eb3210"
 version = "1.7.1"
 
 [[deps.JuBLAS]]
-deps = ["CpuId", "SIMD"]
+deps = ["CpuId", "LinearAlgebra", "SIMD"]
 path = ".."
 uuid = "d8401e69-3990-4c7a-83fd-a8de2d04f897"
 version = "1.0.0"

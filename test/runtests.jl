@@ -1,5 +1,7 @@
 using BenchmarkTools, Test, LinearAlgebra, Random, Printf, JuBLAS
 
+include("transpose_check.jl")
+
 Random.seed!(0)
 
 @testset "gemm! correctness" begin

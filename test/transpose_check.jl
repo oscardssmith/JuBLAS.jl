@@ -32,7 +32,8 @@ end
 
 # Block-aligned + edge sizes. Edges hit the masked-tail path; aligned go
 # through the bulk pointer-load path.
-const SIZES = [(64, 64, 64), (128, 96, 80), (73, 89, 127), (256, 256, 256)]
+const SIZES = [(32, 32, 32), (50, 50, 50), (37, 41, 23),
+               (64, 64, 64), (128, 96, 80), (73, 89, 127), (256, 256, 256)]
 
 @testset "gemm! transpose/adjoint" begin
     @testset "$T" for T in (Float32, Float64, ComplexF32, ComplexF64)

@@ -25,34 +25,38 @@
 
 @inline function _kernel_dispatch!(C::AbstractMatrix{T}, A, B, α, β) where {T}
     k = default_kernel(T, size(C,1), size(C,2), size(A,2))
-    # Real kernels.
-    if     k isa SIMDKernel{8, 24,  8, Float64}
-        _gemm!(C, A, B, α, β, k, nothing, nothing)
-    elseif k isa SIMDKernel{8, 16, 14, Float64}
-        _gemm!(C, A, B, α, β, k, nothing, nothing)
-    elseif k isa SIMDKernel{4,  8,  6, Float64}
-        _gemm!(C, A, B, α, β, k, nothing, nothing)
-    elseif k isa SIMDKernel{2,  2,  4, Float64}
-        _gemm!(C, A, B, α, β, k, nothing, nothing)
-    elseif k isa SIMDKernel{16, 32, 12, Float32}
-        _gemm!(C, A, B, α, β, k, nothing, nothing)
-    elseif k isa SIMDKernel{8,  16,  6, Float32}
-        _gemm!(C, A, B, α, β, k, nothing, nothing)
-    elseif k isa SIMDKernel{4,   4,  6, Float32}
-        _gemm!(C, A, B, α, β, k, nothing, nothing)
-    # Complex kernels.
-    elseif k isa SIMDKernel{8,   8,  8, ComplexF64}
-        _gemm!(C, A, B, α, β, k, nothing, nothing)
-    elseif k isa SIMDKernel{4,   4,  6, ComplexF64}
-        _gemm!(C, A, B, α, β, k, nothing, nothing)
-    elseif k isa SIMDKernel{2,   2,  4, ComplexF64}
-        _gemm!(C, A, B, α, β, k, nothing, nothing)
-    elseif k isa SIMDKernel{16, 32,  6, ComplexF32}
-        _gemm!(C, A, B, α, β, k, nothing, nothing)
-    elseif k isa SIMDKernel{8,   8,  6, ComplexF32}
-        _gemm!(C, A, B, α, β, k, nothing, nothing)
-    elseif k isa SIMDKernel{4,   4,  6, ComplexF32}
-        _gemm!(C, A, B, α, β, k, nothing, nothing)
+    # Enumerate every kernel shape `default_kernel` can return — the AOT path
+    # narrows the UnionAll-typed `k` to a concrete `SIMDKernel{...}` here so
+    # the `_gemm!` call below dispatches to a single specialization. Adding a
+    # new tier or kernel candidate in `default_kernel` requires a matching
+    # branch here, otherwise the trim path will silently fall through.
+
+    # Float32: AVX-512 tiers + AVX2 tiers + SSE2 fallback.
+    if     k isa SIMDKernel{16, 16,  8, Float32}; _gemm!(C, A, B, α, β, k, nothing, nothing)
+    elseif k isa SIMDKernel{16, 32,  8, Float32}; _gemm!(C, A, B, α, β, k, nothing, nothing)
+    elseif k isa SIMDKernel{16, 32, 12, Float32}; _gemm!(C, A, B, α, β, k, nothing, nothing)
+    elseif k isa SIMDKernel{ 8,  8,  8, Float32}; _gemm!(C, A, B, α, β, k, nothing, nothing)
+    elseif k isa SIMDKernel{ 8, 16,  4, Float32}; _gemm!(C, A, B, α, β, k, nothing, nothing)
+    elseif k isa SIMDKernel{ 8, 16,  6, Float32}; _gemm!(C, A, B, α, β, k, nothing, nothing)
+    elseif k isa SIMDKernel{ 4,  4,  6, Float32}; _gemm!(C, A, B, α, β, k, nothing, nothing)
+    # Float64: AVX-512 tiers + AVX2 fallback + SSE2 fallback.
+    elseif k isa SIMDKernel{ 8,  8,  8, Float64}; _gemm!(C, A, B, α, β, k, nothing, nothing)
+    elseif k isa SIMDKernel{ 8, 16,  8, Float64}; _gemm!(C, A, B, α, β, k, nothing, nothing)
+    elseif k isa SIMDKernel{ 8, 16, 14, Float64}; _gemm!(C, A, B, α, β, k, nothing, nothing)
+    elseif k isa SIMDKernel{ 4,  8,  6, Float64}; _gemm!(C, A, B, α, β, k, nothing, nothing)
+    elseif k isa SIMDKernel{ 2,  2,  4, Float64}; _gemm!(C, A, B, α, β, k, nothing, nothing)
+    # ComplexF32: AVX-512 tiers + AVX2 fallback + SSE2 fallback.
+    elseif k isa SIMDKernel{16, 16,  4, ComplexF32}; _gemm!(C, A, B, α, β, k, nothing, nothing)
+    elseif k isa SIMDKernel{16, 32,  4, ComplexF32}; _gemm!(C, A, B, α, β, k, nothing, nothing)
+    elseif k isa SIMDKernel{16, 32,  6, ComplexF32}; _gemm!(C, A, B, α, β, k, nothing, nothing)
+    elseif k isa SIMDKernel{ 8,  8,  6, ComplexF32}; _gemm!(C, A, B, α, β, k, nothing, nothing)
+    elseif k isa SIMDKernel{ 4,  4,  6, ComplexF32}; _gemm!(C, A, B, α, β, k, nothing, nothing)
+    # ComplexF64: AVX-512 tiers + AVX2 fallback + SSE2 fallback.
+    elseif k isa SIMDKernel{ 8,  8,  4, ComplexF64}; _gemm!(C, A, B, α, β, k, nothing, nothing)
+    elseif k isa SIMDKernel{ 8, 16,  4, ComplexF64}; _gemm!(C, A, B, α, β, k, nothing, nothing)
+    elseif k isa SIMDKernel{ 8,  8,  8, ComplexF64}; _gemm!(C, A, B, α, β, k, nothing, nothing)
+    elseif k isa SIMDKernel{ 4,  4,  6, ComplexF64}; _gemm!(C, A, B, α, β, k, nothing, nothing)
+    elseif k isa SIMDKernel{ 2,  2,  4, ComplexF64}; _gemm!(C, A, B, α, β, k, nothing, nothing)
     end
     return nothing
 end

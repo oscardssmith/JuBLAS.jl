@@ -20,12 +20,20 @@ using Base.Cartesian
 function default_kernel(::Type{Float64}, M::Int, N::Int, K::Int)
     sb = _simd_bytes()
     if sb >= 64
-        # Narrow-N override (Float64 AVX-512 only): when N ≤ 128 the default
-        # NR=14 panel leaves only ~9 column tiles, hurting load balance. NR=8
-        # with MR=24 gives ~16 panels and beat the default by ~3 GFLOPS in the
-        # (512, 128, 512) shape sweep.
-        if N <= 128
-            SIMDKernel{8, 24, 8, Float64}()
+        # AVX-512 shape selection from bench/narrow_sweep.jl with step-8
+        # sizes. Three tiers:
+        # - tiny (min(M,N,K) ≤ 8): {8,8,8} fits the entire problem in one
+        #   microkernel call (single MR=W=8 row group × NR=8 col tile).
+        #   Wins (8,8,8) by 34% over {8,16,8} (29.0 vs 19.1 GFLOPS) and
+        #   ties or wins skinny-N8 / short-M8 / rank-K-K8 cases.
+        # - small/medium ({8,16,8}): cleanly divides 16/32/64/128 and stays
+        #   broadly competitive — within 5% of best across nearly the whole
+        #   step-8 grid. Triggers when any dim ≤ 64 OR N ≤ 128.
+        # - else (asymptotic): wide-N default unchanged.
+        if min(M, N, K) <= 8
+            SIMDKernel{8,  8,  8, Float64}()
+        elseif min(M, N, K) <= 64 || N <= 128
+            SIMDKernel{8, 16,  8, Float64}()
         else
             SIMDKernel{8, 16, 14, Float64}()
         end
@@ -39,18 +47,37 @@ end
 function default_kernel(::Type{Float32}, M::Int, N::Int, K::Int)
     sb = _simd_bytes()
     if sb >= 64
-        # Narrow-N override (Float32 AVX-512): NR=12 panels with N≈50 leave
-        # most column tiles partial, hitting the masked edge writeback. NR=6
-        # halves the panel width and was the consistent winner across the
-        # (50,*,*) shape sweep at N=50. Threshold mirrors the Float64 path;
-        # may want refinement once we have data on the 128–512 transition.
-        if N <= 128
-            SIMDKernel{16, 32, 6, Float32}()
+        # AVX-512 shape selection. NR=8 cleanly divides 8/16/32/64/128 and
+        # is broadly competitive across the small/medium regime. MR=16 when
+        # M is small (avoids row-edge waste at N ∈ {40, 48, 72, 80}); MR=32
+        # otherwise (better row-direction parallelism, better load-port
+        # utilization). NR=12 only at the asymptotic regime where K is
+        # large enough to amortize the wider tile. Rank-K with large M, N
+        # (gated to the packed path) wants the small-NR shape too — size
+        # sweep showed ~10% regression with the asymptotic NR=12 there.
+        if min(M, N) <= 128
+            M < 128 ? SIMDKernel{16, 16, 8, Float32}() :
+                      SIMDKernel{16, 32, 8, Float32}()
+        elseif K <= 64
+            SIMDKernel{16, 32,  8, Float32}()
         else
             SIMDKernel{16, 32, 12, Float32}()
         end
     elseif sb >= 32
-        SIMDKernel{8,  16,  6, Float32}()
+        # AVX2 Float32: W = 8, 16 ymm registers, real budget (MR/W)*NR ≤ 14.
+        # Tuned via `bench/kernel_sweep.jl` with `JULIA_JUBLAS_SIMD_BYTES=32
+        # julia --cpu-target=haswell …` (data is on AVX-512 silicon running
+        # AVX2 — close but not identical to true AVX2 microarchitecture).
+        # `{8,16,6}` is broadly competitive across the small/medium regime;
+        # `{8,8,8}` is a single-tile win for the smallest square cases, and
+        # `{8,16,4}` cleanly divides N=16.
+        if M <= 8 && N <= 16
+            SIMDKernel{8,  8, 8, Float32}()
+        elseif min(M, N) <= 16
+            SIMDKernel{8, 16, 4, Float32}()
+        else
+            SIMDKernel{8, 16, 6, Float32}()
+        end
     else
         SIMDKernel{4,   4,  6, Float32}()
     end
@@ -100,6 +127,24 @@ function _gemm!(C::AbstractMatrix{T}, A::AbstractMatrix{T}, B::AbstractMatrix{T}
 
     _scale!(C, β)
     (M == 0 || N == 0 || K == 0) && return C
+
+    # Unpacked fast path: skip pack-A and pack-B when K is small AND at
+    # least one of M, N is small. Pack's value emerges when its one-time
+    # O(N*K) cost is amortized over many ir iterations (M/MR of them) — at
+    # large M, N with small K (rank-K updates) the amortization makes
+    # packing a clear win, so the `min(M, N) ≤ 128` gate keeps those on
+    # the packed path. The K ≤ 128 ceiling reflects the B-panel size
+    # `NR × K × sizeof(T)` that fits in L1d — at NR=8 Float32 / NR=14
+    # Float64, K=128 keeps the panel under ~8 KB, well within L1d budget.
+    # Restricted to SIMDKernel + plain column-major storage; transposed /
+    # strided inputs fall through to the packed path.
+    if kernel isa SIMDKernel &&
+       A isa StridedMatrix{T} && B isa StridedMatrix{T} && C isa StridedMatrix{T} &&
+       stride(A, 1) == 1 && stride(B, 1) == 1 && stride(C, 1) == 1 &&
+       K <= 128 && min(M, N) <= 128
+        _gemm_unpacked!(C, A, B, convert(T, α), kernel)
+        return C
+    end
 
     MR_ = mr(kernel)
     NR_ = nr(kernel)
@@ -487,3 +532,215 @@ end
         return nothing
     end
 end
+
+# ─── Unpacked microkernel + driver (small-problem path) ─────────────────
+#
+# Same MR×NR register tiling and writeback as the packed microkernel. Two
+# differences:
+#   - A is read directly from the matrix at column stride lda per k.
+#   - B is read directly with NR scalar broadcasts per k (one per column,
+#     stride ldb between columns), reused across k via base pointers
+#     hoisted out of the inner loop.
+#
+# Per-row and per-column base pointers are precomputed once, so the inner
+# k-loop only does additions of `k * stride_b` — LLVM gets clean loop-
+# invariant addressing. This was the structural difference from the
+# previous attempt at this kernel; the earlier version ran the full
+# offset arithmetic per k iter and produced pathologically slow code.
+
+@generated function _kernel_unpacked!(::SIMDKernel{W,MR,NR,T},
+                                       C::StridedMatrix{T},
+                                       A::StridedMatrix{T},
+                                       B::StridedMatrix{T},
+                                       ic::Int, jc::Int, K::Int,
+                                       mr_::Int, nr_::Int, α::T,
+                                       ::Val{full}) where {W,MR,NR,T,full}
+    MR % W == 0 ||
+        throw(ArgumentError("SIMDKernel: MR=$MR must be a multiple of W=$W"))
+    rows = MR ÷ W
+    sz   = sizeof(T)
+    Vty  = :(Vec{$W,$T})
+
+    init = Expr[]
+    for r in 1:rows, j in 1:NR
+        push!(init, :( $(Symbol("c_", r, "_", j)) = zero($Vty) ))
+    end
+
+    # Hoisted base pointers: for each row group r, pA_row_r points at the
+    # start of A[ic+(r-1)*W, 1] (k=0). Inner loop adds k*lda_b. Similarly
+    # for each column j, pB_col_j points at the start of B[1, jc+j-1]
+    # (k=0). Inner loop adds k*sz.
+    setup = Expr[]
+    push!(setup, :( lda_b = lda * $sz ))
+    for r in 1:rows
+        roff = (r - 1) * W
+        push!(setup,
+              :( $(Symbol("pA_row_", r)) = pA + ((ic - 1) + $roff) * $sz ))
+    end
+    for j in 1:NR
+        jm1 = j - 1
+        push!(setup,
+              :( $(Symbol("pB_col_", j)) = pB + ((jc - 1 + $jm1) * ldb) * $sz ))
+    end
+
+    # Inner k-loop body. Address = (hoisted base) + k * (per-iter stride).
+    inner_full = Expr[]
+    for r in 1:rows
+        a       = Symbol("a_", r)
+        pA_base = Symbol("pA_row_", r)
+        push!(inner_full, :( $a = vload($Vty, $pA_base + k * lda_b) ))
+    end
+    for j in 1:NR
+        bv      = Symbol("bv_", j)
+        pB_base = Symbol("pB_col_", j)
+        push!(inner_full,
+              :( $bv = $Vty(unsafe_load($pB_base + k * $sz)) ))
+        for r in 1:rows
+            c = Symbol("c_", r, "_", j); a = Symbol("a_", r)
+            push!(inner_full, :( $c = muladd($a, $bv, $c) ))
+        end
+    end
+
+    # Edge path setup: row-direction masked vector load on A, hoisted masks.
+    # B reads are scalar — no load mask, but addresses for j > nr_ point
+    # past valid B columns. Redirect those to pB_col_1 (always valid since
+    # nr_ ≥ 1 in the edge path) so the inner loop can read all NR columns
+    # unconditionally without OOB faults; the j > nr_ accumulators get
+    # garbage but the writeback's `if j <= nr_` gate keeps it out of C.
+    # The packed kernel handles this implicitly via zero-padded Bpack.
+    edge_masks = Expr[]
+    for r in 1:rows
+        roff   = (r - 1) * W
+        mask_r = Symbol("mask_", r)
+        push!(edge_masks, :( $mask_r = prefix_mask(Val($W), mr_ - $roff) ))
+    end
+    for j in 2:NR
+        pB_j = Symbol("pB_col_", j)
+        pB_1 = Symbol("pB_col_", 1)
+        push!(edge_masks, :( $pB_j = ifelse($j <= nr_, $pB_j, $pB_1) ))
+    end
+    inner_edge = Expr[]
+    for r in 1:rows
+        a       = Symbol("a_", r)
+        pA_base = Symbol("pA_row_", r)
+        mask_r  = Symbol("mask_", r)
+        push!(inner_edge,
+              :( $a = vload($Vty, $pA_base + k * lda_b, $mask_r) ))
+    end
+    for j in 1:NR
+        bv      = Symbol("bv_", j)
+        pB_base = Symbol("pB_col_", j)
+        push!(inner_edge,
+              :( $bv = $Vty(unsafe_load($pB_base + k * $sz)) ))
+        for r in 1:rows
+            c = Symbol("c_", r, "_", j); a = Symbol("a_", r)
+            push!(inner_edge, :( $c = muladd($a, $bv, $c) ))
+        end
+    end
+
+    # Writebacks — identical structure to the packed kernel's writebacks.
+    write_full = Expr[]
+    push!(write_full, :( col_stride_b = ldc * $sz ))
+    push!(write_full, :( pCj = pC + ((jc - 1) * ldc + (ic - 1)) * $sz ))
+    for j in 1:NR
+        for r in 1:rows
+            c    = Symbol("c_", r, "_", j)
+            roff = (r - 1) * W
+            poff = roff * sz
+            p    = poff == 0 ? :pCj : :( pCj + $poff )
+            push!(write_full, quote
+                let p = $p
+                    vstore(muladd(αv, $c, vload($Vty, p)), p)
+                end
+            end)
+        end
+        if j < NR
+            push!(write_full, :( pCj = pCj + col_stride_b ))
+        end
+    end
+
+    write_edge = Expr[]
+    push!(write_edge, :( col_stride_b = ldc * $sz ))
+    push!(write_edge, :( pCj = pC + ((jc - 1) * ldc + (ic - 1)) * $sz ))
+    for j in 1:NR
+        body = Expr[]
+        for r in 1:rows
+            c      = Symbol("c_", r, "_", j)
+            mask_r = Symbol("mask_", r)
+            roff   = (r - 1) * W
+            poff   = roff * sz
+            p      = poff == 0 ? :pCj : :( pCj + $poff )
+            push!(body, quote
+                if any($mask_r)
+                    let p = $p
+                        cur = vload($Vty, p, $mask_r)
+                        vstore(muladd(αv, $c, cur), p, $mask_r)
+                    end
+                end
+            end)
+        end
+        push!(write_edge, quote
+            if $j <= nr_
+                $(body...)
+            end
+        end)
+        if j < NR
+            push!(write_edge, :( pCj = pCj + col_stride_b ))
+        end
+    end
+
+    quote
+        $(Expr(:meta, :inline))
+        $(init...)
+        GC.@preserve A B C begin
+            pA  = pointer(A)
+            pB  = pointer(B)
+            lda = stride(A, 2)
+            ldb = stride(B, 2)
+            $(setup...)
+
+            if $full
+                @inbounds for k in 0:K-1
+                    $(inner_full...)
+                end
+            else
+                $(edge_masks...)
+                @inbounds for k in 0:K-1
+                    $(inner_edge...)
+                end
+            end
+
+            pC  = pointer(C)
+            ldc = stride(C, 2)
+            αv  = $Vty(α)
+            if $full
+                $(write_full...)
+            else
+                @inbounds begin $(write_edge...) end
+            end
+        end
+        return nothing
+    end
+end
+
+@inline function _gemm_unpacked!(C::StridedMatrix{T}, A::StridedMatrix{T},
+                                 B::StridedMatrix{T}, α::T,
+                                 kernel::SIMDKernel{W,MR,NR,T}) where {W,MR,NR,T}
+    M, N = size(C)
+    K    = size(A, 2)
+    @inbounds for jr in 0:NR:N-1
+        nr_ = min(NR, N - jr)
+        for ir in 0:MR:M-1
+            mr_ = min(MR, M - ir)
+            ci  = 1 + ir
+            cj  = 1 + jr
+            if mr_ == MR && nr_ == NR
+                _kernel_unpacked!(kernel, C, A, B, ci, cj, K, MR, NR, α, Val(true))
+            else
+                _kernel_unpacked!(kernel, C, A, B, ci, cj, K, mr_, nr_, α, Val(false))
+            end
+        end
+    end
+    return C
+end
+

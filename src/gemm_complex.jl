@@ -21,15 +21,50 @@
 # because their 16-register file can't host the rows=2 accumulator tile.
 function default_kernel(::Type{ComplexF64}, M::Int, N::Int, K::Int)
     sb = _simd_bytes()
-    sb >= 64 ? SIMDKernel{8,  8,  8, ComplexF64}() :   # AVX-512 rows=1
-    sb >= 32 ? SIMDKernel{4,  4,  6, ComplexF64}() :   # AVX2 ymm
-    SIMDKernel{2,  2,  4, ComplexF64}()                # SSE2 xmm
+    if sb >= 64
+        # AVX-512 shape selection from bench/kernel_sweep.jl. NR=4 wins or
+        # ties across nearly the whole shape grid (squares, skinny-N,
+        # short-M, rank-K small-K, deep-K). MR=8 when M is small (avoids
+        # row-edge waste); MR=16 when M is large enough that the wider tile
+        # gets more A reuse per k-iter. {8,8,8} stays the asymptotic
+        # default; rank-K with K > 64 lands here.
+        if min(M, N) <= 128
+            M < 128 ? SIMDKernel{8,  8, 4, ComplexF64}() :
+                      SIMDKernel{8, 16, 4, ComplexF64}()
+        elseif K <= 64
+            SIMDKernel{8, 16, 4, ComplexF64}()
+        else
+            SIMDKernel{8,  8, 8, ComplexF64}()
+        end
+    elseif sb >= 32
+        SIMDKernel{4, 4, 6, ComplexF64}()
+    else
+        SIMDKernel{2, 2, 4, ComplexF64}()
+    end
 end
 function default_kernel(::Type{ComplexF32}, M::Int, N::Int, K::Int)
     sb = _simd_bytes()
-    sb >= 64 ? SIMDKernel{16, 32, 6, ComplexF32}() :   # AVX-512 rows=2
-    sb >= 32 ? SIMDKernel{8,   8, 6, ComplexF32}() :   # AVX2 ymm
-    SIMDKernel{4,   4, 6, ComplexF32}()                # SSE2 xmm
+    if sb >= 64
+        # AVX-512 shape selection from bench/kernel_sweep.jl. NR=4 cleanly
+        # divides 8/16/32/64/128, broadly competitive across the small/medium
+        # regime — and with the complex zmm-pair budget halved (each cell
+        # holds Re+Im accumulators), large NR isn't possible anyway. MR=16
+        # when M is small (avoids the row-edge waste that bites at M ∈ {40,
+        # 48, 72, 80}), MR=32 when M is large enough to use the wider tile.
+        # NR=6 stays the asymptotic default; rank-K with K > 64 lands here.
+        if min(M, N) <= 128
+            M < 128 ? SIMDKernel{16, 16, 4, ComplexF32}() :
+                      SIMDKernel{16, 32, 4, ComplexF32}()
+        elseif K <= 64
+            SIMDKernel{16, 32, 4, ComplexF32}()
+        else
+            SIMDKernel{16, 32, 6, ComplexF32}()
+        end
+    elseif sb >= 32
+        SIMDKernel{8, 8, 6, ComplexF32}()
+    else
+        SIMDKernel{4, 4, 6, ComplexF32}()
+    end
 end
 
 # Block sizes (`mc_block` / `kc_block` / `nc_block`) for `SIMDKernel{...,

@@ -26,13 +26,19 @@ idiom).
 """
 @generated function prefix_mask(::Val{N}, n::Int64) where {N}
     @assert N in (1, 2, 4, 8, 16, 32, 64) "prefix_mask: N must be a power of 2 ≤ 64"
+    # Clamp `n` into [0, N] via smax then smin. Need both: `smin` alone
+    # leaves negatives untouched (smin(-11, 16) = -11), and `umin` alone
+    # treats negatives as huge unsigned (returns N → all lanes true) —
+    # both wrong for callers that subtract a row offset and may go negative.
+    #
     # `fshr.i64(0, -1, k)` interprets shift count `k` modulo 64, so a
     # `k == 64` (i.e., `clamped == 0`) collapses to `k == 0` and returns
     # `-1` instead of `0`. Guard with a `select` on the `clamped == 0` case.
     ir = """
         define <$N x i8> @entry(i64 %n) #0 {
         top:
-            %clamped = call i64 @llvm.umin.i64(i64 %n, i64 $N)
+            %nonneg = call i64 @llvm.smax.i64(i64 %n, i64 0)
+            %clamped = call i64 @llvm.smin.i64(i64 %nonneg, i64 $N)
             %shift_amt = sub i64 64, %clamped
             %ones = sub i64 0, 1
             %shifted = call i64 @llvm.fshr.i64(i64 0, i64 %ones, i64 %shift_amt)
@@ -43,7 +49,8 @@ idiom).
             %m8 = zext <$N x i1> %m1 to <$N x i8>
             ret <$N x i8> %m8
         }
-        declare i64 @llvm.umin.i64(i64, i64)
+        declare i64 @llvm.smax.i64(i64, i64)
+        declare i64 @llvm.smin.i64(i64, i64)
         declare i64 @llvm.fshr.i64(i64, i64, i64)
         attributes #0 = { alwaysinline }
         """
@@ -118,7 +125,13 @@ end
 end
 
 @noinline function _detect_simd_bytes!()
-    sb = try; Int(CpuId.simdbytes()); catch; 0; end
+    # Env-var override for benchmarking AVX2/SSE2 paths on AVX-512 hardware:
+    # `JULIA_JUBLAS_SIMD_BYTES=32 julia --cpu-target=haswell ...` tunes the
+    # AVX2 branch without needing different silicon.
+    sb = let env = get(ENV, "JULIA_JUBLAS_SIMD_BYTES", "")
+        isempty(env) ? (try; Int(CpuId.simdbytes()); catch; 0; end) :
+                       parse(Int, env)
+    end
     _SIMD_BYTES_CACHE[] = sb
     return sb
 end

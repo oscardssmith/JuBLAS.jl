@@ -16,11 +16,7 @@ const N     = length(ARGS) >= 1 ? parse(Int, ARGS[1]) : 512
 const ITERS = length(ARGS) >= 2 ? parse(Int, ARGS[2]) : 5000
 const ELT   = length(ARGS) >= 3 ? Symbol(ARGS[3])     : :Float32
 
-const T = ELT === :Float32    ? Float32    :
-          ELT === :Float64    ? Float64    :
-          ELT === :ComplexF32 ? ComplexF32 :
-          ELT === :ComplexF64 ? ComplexF64 :
-          error("unknown eltype: $ELT  (expected Float32, Float64, ComplexF32, ComplexF64)")
+const T = eval(ELT)
 
 # Real gemm: 2 flops per output-elt-per-K (1 mul + 1 add).
 # Complex: 8 flops per output-elt-per-K (4 muls + 4 adds for one cMAC).

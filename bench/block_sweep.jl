@@ -21,11 +21,7 @@ const N     = length(ARGS) >= 1 ? parse(Int, ARGS[1]) : 512
 const ITERS = length(ARGS) >= 2 ? parse(Int, ARGS[2]) : 500
 const ELT   = length(ARGS) >= 3 ? Symbol(ARGS[3])     : :Float64
 
-const T = ELT === :Float32    ? Float32    :
-          ELT === :Float64    ? Float64    :
-          ELT === :ComplexF32 ? ComplexF32 :
-          ELT === :ComplexF64 ? ComplexF64 :
-          error("unknown eltype: $ELT  (expected Float32, Float64, ComplexF32, ComplexF64)")
+const T = eval(ELT)
 
 # Real packs into `Vector{T}`; complex packs Re/Im sub-panels into
 # `Vector{TR}` of double the element count.

@@ -79,24 +79,49 @@ lanes are not written. Equivalent to
 
 # ─── Runtime CPU detection ────────────────────────────────────────────────
 #
-# Each call issues CPUID and parses the result — ~hundreds of cycles, run a
-# handful of times per `gemm!` call, lost in the noise of a millisecond-
-# scale matmul. CpuId is x86-only and may throw on hypervisors that hide
-# cache info; fall back to Skylake-class defaults.
+# CPUID parses are cheap individually but called several times per `gemm!`
+# (3 cache levels + simd width), and a try/catch around each one is not
+# free. At N=50 the matmul itself is ~5 µs, so per-call CPUID cost shows
+# up in the profile — measured ~3 µs of overhead in `_gemm!` outside the
+# packing/kernel phases, much of it from these calls.
+#
+# Memoize via a sentinel `Ref`, populated on first call. Avoids `__init__`
+# (which fights precompile) and keeps the hot path to a Ref load + branch.
+# CpuId is x86-only and may throw on hypervisors that hide cache info;
+# fall back to Skylake-class defaults.
 
-function _cache_sizes()
-    try
-        cs = CpuId.cachesize()
-        l1 = length(cs) >= 1 && cs[1] > 0 ? Int(cs[1]) : 32 * 1024
-        l2 = length(cs) >= 2 && cs[2] > 0 ? Int(cs[2]) : 1024 * 1024
-        l3 = length(cs) >= 3 && cs[3] > 0 ? Int(cs[3]) : 16 * 1024 * 1024
-        return (l1, l2, l3)
-    catch
-        return (32 * 1024, 1024 * 1024, 16 * 1024 * 1024)
-    end
+const _CACHE_SIZES_CACHE = Ref{NTuple{3,Int}}((0, 0, 0))
+const _SIMD_BYTES_CACHE  = Ref{Int}(-1)
+
+@inline function _cache_sizes()
+    cs = _CACHE_SIZES_CACHE[]
+    cs[1] == 0 ? _detect_cache_sizes!() : cs
 end
 
-_simd_bytes() = try; Int(CpuId.simdbytes()); catch; 0; end
+@noinline function _detect_cache_sizes!()
+    cs = try
+        raw = CpuId.cachesize()
+        l1 = length(raw) >= 1 && raw[1] > 0 ? Int(raw[1]) : 32 * 1024
+        l2 = length(raw) >= 2 && raw[2] > 0 ? Int(raw[2]) : 1024 * 1024
+        l3 = length(raw) >= 3 && raw[3] > 0 ? Int(raw[3]) : 16 * 1024 * 1024
+        (l1, l2, l3)
+    catch
+        (32 * 1024, 1024 * 1024, 16 * 1024 * 1024)
+    end
+    _CACHE_SIZES_CACHE[] = cs
+    return cs
+end
+
+@inline function _simd_bytes()
+    sb = _SIMD_BYTES_CACHE[]
+    sb >= 0 ? sb : _detect_simd_bytes!()
+end
+
+@noinline function _detect_simd_bytes!()
+    sb = try; Int(CpuId.simdbytes()); catch; 0; end
+    _SIMD_BYTES_CACHE[] = sb
+    return sb
+end
 
 # ─── Kernel types ─────────────────────────────────────────────────────────
 

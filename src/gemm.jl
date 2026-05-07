@@ -38,9 +38,22 @@ end
 
 function default_kernel(::Type{Float32}, M::Int, N::Int, K::Int)
     sb = _simd_bytes()
-    sb >= 64 ? SIMDKernel{16, 32, 12, Float32}() :
-    sb >= 32 ? SIMDKernel{8,  16,  6, Float32}() :
-    SIMDKernel{4,   4,  6, Float32}()
+    if sb >= 64
+        # Narrow-N override (Float32 AVX-512): NR=12 panels with N≈50 leave
+        # most column tiles partial, hitting the masked edge writeback. NR=6
+        # halves the panel width and was the consistent winner across the
+        # (50,*,*) shape sweep at N=50. Threshold mirrors the Float64 path;
+        # may want refinement once we have data on the 128–512 transition.
+        if N <= 128
+            SIMDKernel{16, 32, 6, Float32}()
+        else
+            SIMDKernel{16, 32, 12, Float32}()
+        end
+    elseif sb >= 32
+        SIMDKernel{8,  16,  6, Float32}()
+    else
+        SIMDKernel{4,   4,  6, Float32}()
+    end
 end
 
 """

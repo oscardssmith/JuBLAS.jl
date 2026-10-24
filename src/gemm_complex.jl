@@ -435,8 +435,10 @@ function _gemm!(C::AbstractMatrix{Complex{TR}}, A::AbstractMatrix{Complex{TR}}, 
     size(A, 2) == size(B, 1)  || throw(DimensionMismatch("size(A,2) ≠ size(B,1)"))
     K = size(A, 2)
 
+    # See the real `_gemm!`: α == 0 / β == 0 / K == 0 semantics.
+    (M == 0 || N == 0) && return C
     _scale!(C, β)
-    (M == 0 || N == 0 || K == 0) && return C
+    (K == 0 || iszero(α)) && return C
 
     caches = _cache_sizes()
     MC_ = mc_block(kernel, caches)

@@ -3,6 +3,7 @@ using Libdl
 
 include("transpose_check.jl")
 include("test_libjublas.jl")
+include("alpha_beta_semantics.jl")
 
 Random.seed!(0)
 

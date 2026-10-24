@@ -125,8 +125,13 @@ function _gemm!(C::AbstractMatrix{T}, A::AbstractMatrix{T}, B::AbstractMatrix{T}
     size(A, 2) == size(B, 1)  || throw(DimensionMismatch("size(A,2) ≠ size(B,1)"))
     K = size(A, 2)
 
+    # As in reference BLAS, β == 0 overwrites C without reading it and
+    # α == 0 never reads A or B, so NaN/Inf there can't leak into C. K == 0
+    # also gives exactly β·C, even for non-finite α (reference BLAS's
+    # transposed-A loops would compute α·0 = NaN there).
+    (M == 0 || N == 0) && return C
     _scale!(C, β)
-    (M == 0 || N == 0 || K == 0) && return C
+    (K == 0 || iszero(α)) && return C
 
     # Unpacked fast path: skip pack-A and pack-B when K is small AND at
     # least one of M, N is small. Pack's value emerges when its one-time

@@ -35,7 +35,10 @@ end
 
 `Float64`, `Float32`, `ComplexF64`, and `ComplexF32` all dispatch to a
 SIMD microkernel (AVX-512 / AVX2 / SSE2 picked at runtime). Other element
-types fall through to a scalar `@generated` kernel.
+types fall through to a scalar `@generated` kernel. `ScalarKernel{MR,NR}()`
+can also be passed explicitly (`gemm!(C, A, B, α, β; kernel =
+ScalarKernel{4,4}())`) for real and complex eltypes; it uses no SIMD code
+and no CPU detection.
 
 ## Layout
 

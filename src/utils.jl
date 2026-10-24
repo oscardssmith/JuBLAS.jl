@@ -198,11 +198,16 @@ default_kernel(::Type{T}) where {T} =
 # (`gemm!`, `gemm_workspace`) query `_cache_sizes()` once and thread the
 # tuple through, so a single `gemm!` call costs one CpuId trip.
 
-# ScalarKernel / AbstractKernel fallback: no cache-aware tuning — used only
-# for the non-strided-C path, which isn't perf-critical.
-mc_block(k::AbstractKernel, _caches=_cache_sizes()) = cld(72, mr(k)) * mr(k)
-kc_block(::AbstractKernel,  _caches=_cache_sizes()) = 256
-nc_block(::AbstractKernel,  _caches=_cache_sizes()) = 4080
+# Cache sizes to pass to the block-size traits. Only the `SIMDKernel`
+# methods use them, so other kernels never trigger CPU detection.
+@inline _block_caches(::SIMDKernel) = _cache_sizes()
+@inline _block_caches(::AbstractKernel) = (0, 0, 0)
+
+# ScalarKernel / AbstractKernel fallback: no cache-aware tuning — used for
+# explicit ScalarKernels and the non-strided-C path, neither perf-critical.
+mc_block(k::AbstractKernel, _caches=nothing) = cld(72, mr(k)) * mr(k)
+kc_block(::AbstractKernel,  _caches=nothing) = 256
+nc_block(::AbstractKernel,  _caches=nothing) = 4080
 
 # SIMDKernel block sizes follow the Goto/BLIS cache hierarchy:
 #

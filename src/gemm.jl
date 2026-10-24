@@ -6,7 +6,8 @@
 #
 # Kernel types, default selection, block-size traits, CPU detection, the
 # `prefix_mask` SIMD primitives, and the shared `_scale!` helper all live
-# in `utils.jl`. Complex gemm lives in `gemm_complex.jl`.
+# in `utils.jl`. Complex gemm lives in `gemm_complex.jl`; its ScalarKernel
+# path reuses `_gemm_packed!` from here.
 
 using Base.Cartesian
 
@@ -94,7 +95,7 @@ for any problem size that fits.
 """
 function gemm_workspace(::Type{T}, kernel::AbstractKernel) where {T}
     MR_ = mr(kernel); NR_ = nr(kernel)
-    caches = _cache_sizes()
+    caches = _block_caches(kernel)
     MC_ = mc_block(kernel, caches)
     KC_ = kc_block(kernel, caches)
     NC_ = nc_block(kernel, caches)
@@ -119,14 +120,9 @@ function _gemm!(C::AbstractMatrix{T}, A::AbstractMatrix{T}, B::AbstractMatrix{T}
                 α, β, kernel::AbstractKernel,
                 Apack::Union{Vector{T},Nothing},
                 Bpack::Union{Vector{T},Nothing}) where {T<:Real}
+    _gemm_prologue!(C, A, B, α, β) && return C
     M, N = size(C)
-    size(A, 1) == M           || throw(DimensionMismatch("size(A,1) ≠ size(C,1)"))
-    size(B, 2) == N           || throw(DimensionMismatch("size(B,2) ≠ size(C,2)"))
-    size(A, 2) == size(B, 1)  || throw(DimensionMismatch("size(A,2) ≠ size(B,1)"))
     K = size(A, 2)
-
-    _scale!(C, β)
-    (M == 0 || N == 0 || K == 0) && return C
 
     # Unpacked fast path: skip pack-A and pack-B when K is small AND at
     # least one of M, N is small. Pack's value emerges when its one-time
@@ -146,9 +142,36 @@ function _gemm!(C::AbstractMatrix{T}, A::AbstractMatrix{T}, B::AbstractMatrix{T}
         return C
     end
 
+    return _gemm_packed!(C, A, B, convert(T, α), kernel, Apack, Bpack)
+end
+
+# Shape checks plus the α/β handling shared by every `_gemm!` driver. As in
+# reference BLAS, β == 0 overwrites C without reading it and α == 0 never
+# reads A or B, so NaN/Inf there can't leak into C. K == 0 also gives
+# exactly β·C, even for non-finite α (reference BLAS's transposed-A loops
+# would compute α·0 = NaN there). Returns `true` when C is already final.
+@inline function _gemm_prologue!(C::AbstractMatrix, A::AbstractMatrix, B::AbstractMatrix, α, β)
+    M, N = size(C)
+    size(A, 1) == M           || throw(DimensionMismatch("size(A,1) ≠ size(C,1)"))
+    size(B, 2) == N           || throw(DimensionMismatch("size(B,2) ≠ size(C,2)"))
+    size(A, 2) == size(B, 1)  || throw(DimensionMismatch("size(A,2) ≠ size(B,1)"))
+    (M == 0 || N == 0) && return true
+    _scale!(C, β)
+    return size(A, 2) == 0 || iszero(α)
+end
+
+# Goto-style packed driver with pack buffers of eltype `T` (the layout
+# `ScalarKernel` and real `SIMDKernel`s consume). Assumes `_gemm_prologue!`
+# has run: M, N, K ≥ 1 and C already holds β·C.
+@inline function _gemm_packed!(C::AbstractMatrix{T}, A::AbstractMatrix{T}, B::AbstractMatrix{T},
+                               αT::T, kernel::AbstractKernel,
+                               Apack::Union{Vector{T},Nothing},
+                               Bpack::Union{Vector{T},Nothing}) where {T}
+    M, N = size(C)
+    K = size(A, 2)
     MR_ = mr(kernel)
     NR_ = nr(kernel)
-    caches = _cache_sizes()
+    caches = _block_caches(kernel)
     MC_ = mc_block(kernel, caches)
     KC_ = kc_block(kernel, caches)
     NC_ = nc_block(kernel, caches)
@@ -164,7 +187,6 @@ function _gemm!(C::AbstractMatrix{T}, A::AbstractMatrix{T}, B::AbstractMatrix{T}
         throw(ArgumentError("Apack too small: have $(length(Apack)), need $apack_sz"))
     length(Bpack) >= bpack_sz ||
         throw(ArgumentError("Bpack too small: have $(length(Bpack)), need $bpack_sz"))
-    αT    = convert(T, α)
 
     @inbounds for jc in 1:NC_:N
         nc = min(NC_, N - jc + 1)

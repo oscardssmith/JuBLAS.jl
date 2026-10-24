@@ -365,15 +365,15 @@ end
     end
 end
 
-# AbstractMatrix fallback: pack/macrokernel still needs strided pointer math,
-# but if `C` isn't strided we have nowhere to point. Defer to the scalar
-# kernel.
+# Non-strided C never gets here: the complex SIMD `_gemm!` routes it to the
+# ScalarKernel path before packing. Kept as a clear error for direct callers.
 @inline function _kernel!(k::SIMDKernel{W,MR,NR,Complex{TR}}, C::AbstractMatrix{Complex{TR}},
                           Apack::Vector{TR}, Bpack::Vector{TR},
                           ao::Int, bo::Int, kc::Int, ci::Int, cj::Int,
                           mr_::Int, nr_::Int, α::Complex{TR},
                           v::Val) where {W,MR,NR,TR<:Real}
-    error("SIMDKernel{...,Complex} requires StridedMatrix C; got $(typeof(C))")
+    error("SIMDKernel{...,Complex} _kernel! requires StridedMatrix C; got $(typeof(C)) " *
+          "(use _gemm!, which routes this case to ScalarKernel)")
 end
 
 # ─── Macrokernel ──────────────────────────────────────────────────────────
@@ -416,12 +416,14 @@ end
 
 # Public kwarg surface. The trim path doesn't go through here — juliac
 # entry points in `blas_interface.jl` call `_gemm!` directly with a
-# concretely-typed kernel — so this stays as a thin forwarder.
+# concretely-typed kernel — so this stays as a thin forwarder. Pack buffers
+# are `Vector{TR}` (Re/Im sub-panels) for `SIMDKernel`, `Vector{Complex{TR}}`
+# for `ScalarKernel`; `gemm_workspace(T, kernel)` returns the right kind.
 function gemm!(C::AbstractMatrix{Complex{TR}}, A::AbstractMatrix{Complex{TR}}, B::AbstractMatrix{Complex{TR}},
                α = true, β = false;
-               kernel::SIMDKernel{W,MR,NR,Complex{TR}} = default_kernel(Complex{TR}, size(C,1), size(C,2), size(A,2)),
-               Apack::Union{Vector{TR},Nothing} = nothing,
-               Bpack::Union{Vector{TR},Nothing} = nothing) where {W,MR,NR,TR<:Real}
+               kernel::AbstractKernel = default_kernel(Complex{TR}, size(C,1), size(C,2), size(A,2)),
+               Apack::Union{Vector{TR},Vector{Complex{TR}},Nothing} = nothing,
+               Bpack::Union{Vector{TR},Vector{Complex{TR}},Nothing} = nothing) where {TR<:Real}
     _gemm!(C, A, B, α, β, kernel, Apack, Bpack)
 end
 
@@ -429,14 +431,14 @@ function _gemm!(C::AbstractMatrix{Complex{TR}}, A::AbstractMatrix{Complex{TR}}, 
                 α, β, kernel::SIMDKernel{W,MR,NR,Complex{TR}},
                 Apack::Union{Vector{TR},Nothing},
                 Bpack::Union{Vector{TR},Nothing}) where {W,MR,NR,TR<:Real}
+    # The SIMD kernels write C through raw pointers; anything else goes
+    # through the ScalarKernel path (which packs into its own buffers, so
+    # user-supplied Re/Im `Apack`/`Bpack` can't be reused).
+    C isa StridedMatrix ||
+        return _gemm!(C, A, B, α, β, ScalarKernel{MR,NR}(), nothing, nothing)
+    _gemm_prologue!(C, A, B, α, β) && return C
     M, N = size(C)
-    size(A, 1) == M           || throw(DimensionMismatch("size(A,1) ≠ size(C,1)"))
-    size(B, 2) == N           || throw(DimensionMismatch("size(B,2) ≠ size(C,2)"))
-    size(A, 2) == size(B, 1)  || throw(DimensionMismatch("size(A,2) ≠ size(B,1)"))
     K = size(A, 2)
-
-    _scale!(C, β)
-    (M == 0 || N == 0 || K == 0) && return C
 
     caches = _cache_sizes()
     MC_ = mc_block(kernel, caches)
@@ -467,4 +469,92 @@ function _gemm!(C::AbstractMatrix{Complex{TR}}, A::AbstractMatrix{Complex{TR}}, 
         end
     end
     return C
+end
+
+# ─── ScalarKernel path ────────────────────────────────────────────────────
+#
+# Complex `ScalarKernel` gemm reuses the generic packed driver
+# (`_gemm_packed!`), macrokernel and `ScalarKernel` microkernel from
+# `gemm.jl` unchanged: they are written against an eltype-`T` pack buffer
+# and `muladd`, which `Complex` supports. Only packing is complex-specific:
+# buffers are `Vector{Complex{TR}}` with the real-path panel layout (R
+# consecutive elements per k, zero-padded edge panels), filled by plain
+# element copies — no `VecElement` bulk loads, no pointer arithmetic, so
+# any `AbstractMatrix` (views, non-unit strides) works. Adjoint conjugates
+# while packing.
+#
+# `_pack_cols!`: panel index runs along dim 1 of `P`, depth along dim 2
+#   buf[p*R*kc + k*R + i] = op(P[r0 + p*R + i - 1, k0 + k])
+# `_pack_rows!`: panel index runs along dim 2 of `P`, depth along dim 1
+#   buf[p*R*kc + k*R + j] = op(P[k0 + k, r0 + p*R + j - 1])
+
+@inline function _pack_cols!(buf::Vector{T}, P::AbstractMatrix{T}, r0::Int, k0::Int,
+                             len::Int, kc::Int, ::Val{R}, op::F) where {T,R,F}
+    z = zero(T)
+    @inbounds for p in 0:cld(len, R)-1
+        rs   = p * R
+        rmax = min(R, len - rs)
+        base_panel = p * R * kc
+        for k in 0:kc-1
+            base = base_panel + k * R
+            for i in 1:rmax
+                buf[base + i] = op(P[r0 + rs + i - 1, k0 + k])
+            end
+            for i in rmax+1:R
+                buf[base + i] = z
+            end
+        end
+    end
+    return buf
+end
+
+@inline function _pack_rows!(buf::Vector{T}, P::AbstractMatrix{T}, k0::Int, r0::Int,
+                             kc::Int, len::Int, ::Val{R}, op::F) where {T,R,F}
+    z = zero(T)
+    @inbounds for p in 0:cld(len, R)-1
+        cs   = p * R
+        cmax = min(R, len - cs)
+        base_panel = p * R * kc
+        for k in 0:kc-1
+            base = base_panel + k * R
+            for j in 1:cmax
+                buf[base + j] = op(P[k0 + k, r0 + cs + j - 1])
+            end
+            for j in cmax+1:R
+                buf[base + j] = z
+            end
+        end
+    end
+    return buf
+end
+
+# A is M×K: plain A packs along its rows; op(P) with P K×M packs along P's
+# columns (the same role swap the real path uses).
+@inline _pack_A!(Apack::Vector{T}, A::AbstractMatrix{T},
+                 ic::Int, pc::Int, mc::Int, kc::Int, v::Val) where {T<:Complex} =
+    _pack_cols!(Apack, A, ic, pc, mc, kc, v, identity)
+@inline _pack_A!(Apack::Vector{T}, A::Transpose{T, <:AbstractMatrix{T}},
+                 ic::Int, pc::Int, mc::Int, kc::Int, v::Val) where {T<:Complex} =
+    _pack_rows!(Apack, parent(A), pc, ic, kc, mc, v, identity)
+@inline _pack_A!(Apack::Vector{T}, A::Adjoint{T, <:AbstractMatrix{T}},
+                 ic::Int, pc::Int, mc::Int, kc::Int, v::Val) where {T<:Complex} =
+    _pack_rows!(Apack, parent(A), pc, ic, kc, mc, v, conj)
+
+# B is K×N: plain B packs along its columns; op(P) with P N×K along P's rows.
+@inline _pack_B!(Bpack::Vector{T}, B::AbstractMatrix{T},
+                 pc::Int, jc::Int, kc::Int, nc::Int, v::Val) where {T<:Complex} =
+    _pack_rows!(Bpack, B, pc, jc, kc, nc, v, identity)
+@inline _pack_B!(Bpack::Vector{T}, B::Transpose{T, <:AbstractMatrix{T}},
+                 pc::Int, jc::Int, kc::Int, nc::Int, v::Val) where {T<:Complex} =
+    _pack_cols!(Bpack, parent(B), jc, pc, nc, kc, v, identity)
+@inline _pack_B!(Bpack::Vector{T}, B::Adjoint{T, <:AbstractMatrix{T}},
+                 pc::Int, jc::Int, kc::Int, nc::Int, v::Val) where {T<:Complex} =
+    _pack_cols!(Bpack, parent(B), jc, pc, nc, kc, v, conj)
+
+function _gemm!(C::AbstractMatrix{T}, A::AbstractMatrix{T}, B::AbstractMatrix{T},
+                α, β, kernel::ScalarKernel,
+                Apack::Union{Vector{T},Nothing},
+                Bpack::Union{Vector{T},Nothing}) where {T<:Complex}
+    _gemm_prologue!(C, A, B, α, β) && return C
+    return _gemm_packed!(C, A, B, convert(T, α), kernel, Apack, Bpack)
 end

@@ -1,6 +1,6 @@
 # Shared infrastructure for JuBLAS:
 #   - SIMD primitives not yet in SIMD.jl (`prefix_mask` and friends)
-#   - Runtime CPU detection (cache sizes, SIMD width) via CpuId.jl
+#   - Runtime CPU detection: cache sizes via CpuId.jl, SIMD width via Base
 #   - Kernel type definitions (`AbstractKernel`, `ScalarKernel`, `SIMDKernel`)
 #     + default kernel selection
 #   - Cache-tuned block-size traits (`mc_block`, `kc_block`, `nc_block`)
@@ -129,11 +129,20 @@ end
     # `JULIA_JUBLAS_SIMD_BYTES=32 julia --cpu-target=haswell ...` tunes the
     # AVX2 branch without needing different silicon.
     sb = let env = get(ENV, "JULIA_JUBLAS_SIMD_BYTES", "")
-        isempty(env) ? (try; Int(CpuId.simdbytes()); catch; 0; end) :
-                       parse(Int, env)
+        isempty(env) ? _host_simd_bytes() : parse(Int, env)
     end
     _SIMD_BYTES_CACHE[] = sb
     return sb
+end
+
+# Julia's own feature detection, unlike CpuId, also runs off x86. Its
+# feature indices are per-arch, so only test x86 ones on x86; elsewhere
+# assume 128-bit vectors (NEON on aarch64).
+function _host_simd_bytes()
+    Sys.ARCH in (:x86_64, :i686) || return 16
+    CPUID = Base.BinaryPlatforms.CPUID
+    CPUID.test_cpu_feature(CPUID.JL_X86_avx512f) ? 64 :
+    CPUID.test_cpu_feature(CPUID.JL_X86_avx)     ? 32 : 16
 end
 
 # ─── Kernel types ─────────────────────────────────────────────────────────

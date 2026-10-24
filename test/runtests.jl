@@ -175,3 +175,10 @@ end
         end
     end
 end
+
+@testset "SIMD width detection" begin
+    @test JuBLAS._host_simd_bytes() in (16, 32, 64)
+    env = get(ENV, "JULIA_JUBLAS_SIMD_BYTES", "")
+    @test JuBLAS._simd_bytes() ==
+          (isempty(env) ? JuBLAS._host_simd_bytes() : parse(Int, env))
+end

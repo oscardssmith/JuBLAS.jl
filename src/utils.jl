@@ -4,7 +4,7 @@
 #   - Kernel type definitions (`AbstractKernel`, `ScalarKernel`, `SIMDKernel`)
 #     + default kernel selection
 #   - Cache-tuned block-size traits (`mc_block`, `kc_block`, `nc_block`)
-#   - Misc helpers (`_scale!`)
+#   - Misc helpers (`_scale!`, `_unit_stride1`)
 #
 # Real-specific gemm code lives in `gemm.jl`; complex-specific code in
 # `gemm_complex.jl`. Both depend on the type and trait definitions here.
@@ -246,6 +246,12 @@ function nc_block(k::SIMDKernel{W,MR,NR,T}, caches=_cache_sizes()) where {W,MR,N
 end
 
 # ─── Misc helpers ─────────────────────────────────────────────────────────
+
+# Whether the pointer-based pack loops and SIMD writeback can address `X`:
+# strided with contiguous columns. Other layouts (stepped or reversed rows,
+# index-vector views, ...) are packed element by element instead.
+@inline _unit_stride1(X::StridedMatrix) = stride(X, 1) == 1
+@inline _unit_stride1(::AbstractMatrix) = false
 
 function _scale!(C::AbstractMatrix{T}, β) where {T}
     if iszero(β)

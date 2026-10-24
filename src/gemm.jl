@@ -119,6 +119,13 @@ function _gemm!(C::AbstractMatrix{T}, A::AbstractMatrix{T}, B::AbstractMatrix{T}
                 α, β, kernel::AbstractKernel,
                 Apack::Union{Vector{T},Nothing},
                 Bpack::Union{Vector{T},Nothing}) where {T<:Real}
+    # The SIMD microkernels store whole columns of a tile with vector
+    # stores, which needs unit row stride; other strided C go through the
+    # scalar microkernel of the same shape. (Non-strided C already does,
+    # via the `_kernel!` fallback.)
+    if kernel isa SIMDKernel && C isa StridedMatrix && stride(C, 1) != 1
+        return _gemm!(C, A, B, α, β, _scalar_kernel(kernel), nothing, nothing)
+    end
     M, N = size(C)
     size(A, 1) == M           || throw(DimensionMismatch("size(A,1) ≠ size(C,1)"))
     size(B, 2) == N           || throw(DimensionMismatch("size(B,2) ≠ size(C,2)"))
@@ -187,7 +194,8 @@ end
 # bypasses LLVM's cost-model preference for ymm-versioning + scalar tails:
 # we hand it a single `<MR × T>` value, which lowers to one (or `MR/W`)
 # zmm-width move on AVX-512 targets, no memcheck, no tail.
-# Slow path: edge panel with partial copy + zero fill.
+# Slow path: edge panel with partial copy + zero fill, also used for every
+# panel when A isn't column-contiguous (see `_unit_stride1`).
 @generated function _pack_A!(Apack::Vector{T}, A::AbstractMatrix{T},
                               ic::Int, pc::Int, mc::Int, kc::Int,
                               ::Val{MR}) where {T,MR}
@@ -196,15 +204,16 @@ end
         $(Expr(:meta, :inline))
         z = zero($T)
         npanels = cld(mc, $MR)
+        fast = _unit_stride1(A)
         GC.@preserve Apack A begin
             pAp = pointer(Apack)
-            pA  = pointer(A)
-            ldA = stride(A, 2)
+            pA  = fast ? pointer(A) : Ptr{$T}(C_NULL)
+            ldA = fast ? stride(A, 2) : 0
             @inbounds for p in 0:npanels-1
                 rs   = p * $MR
                 rmax = min($MR, mc - rs)
                 base_panel = p * $MR * kc
-                if rmax == $MR
+                if rmax == $MR && fast
                     # Bulk MR-element copy via raw `NTuple{MR,VecElement{T}}`
                     # cast. Works for any `isbitstype(T)` (including
                     # `ComplexF64`), unlike `SIMD.Vec` which is restricted to
@@ -257,17 +266,18 @@ end
         $(Expr(:meta, :inline))
         z = zero($T)
         npanels = cld(nc, $NR)
+        fast = _unit_stride1(B)
         GC.@preserve Bpack B begin
             pBp0 = pointer(Bpack)
-            pB0  = pointer(B)
-            ldB  = stride(B, 2)
+            pB0  = fast ? pointer(B) : Ptr{$T}(C_NULL)
+            ldB  = fast ? stride(B, 2) : 0
             ldB_b = ldB * $sz
             @inbounds for p in 0:npanels-1
                 cs   = p * $NR
                 cmax = min($NR, nc - cs)
                 base_panel = p * $NR * kc
                 col_off_b = ((pc - 1) + (jc + cs - 1) * ldB) * $sz
-                if cmax == $NR
+                if cmax == $NR && fast
                     for k in 0:kc-1
                         pB  = pB0  + col_off_b + k * $sz
                         pBp = pBp0 + (base_panel + k * $NR) * $sz
@@ -400,6 +410,8 @@ end
 end
 
 # ─── Microkernel: SIMDKernel (parametric on W, MR, NR, T; JIT-unrolled) ──
+
+_scalar_kernel(::SIMDKernel{W,MR,NR}) where {W,MR,NR} = ScalarKernel{MR,NR}()
 
 # Non-strided fallback: route through the scalar kernel.
 @inline function _kernel!(::SIMDKernel{W,MR,NR,T}, C::AbstractMatrix{T},

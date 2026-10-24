@@ -91,15 +91,16 @@ end
         $(Expr(:meta, :inline))
         z = zero($TR)
         npanels = cld(mc, $MR)
+        fast = _unit_stride1(A)             # else pack element by element
         GC.@preserve Apack A begin
             pAp = pointer(Apack)
-            pA  = Ptr{$TR}(pointer(A))
-            ldA = stride(A, 2)              # in complex elements
+            pA  = fast ? Ptr{$TR}(pointer(A)) : Ptr{$TR}(C_NULL)
+            ldA = fast ? stride(A, 2) : 0   # in complex elements
             @inbounds for p in 0:npanels-1
                 rs    = p * $MR
                 rmax  = min($MR, mc - rs)
                 base  = p * 2 * $MR * kc
-                if rmax == $MR
+                if rmax == $MR && fast
                     # Fast path: full MR-row tile. Each k iter touches 2*MR
                     # consecutive `TR` values in column-major A and writes them
                     # de-interleaved into Apack.
@@ -143,15 +144,16 @@ end
         $(Expr(:meta, :inline))
         z = zero($TR)
         npanels = cld(nc, $NR)
+        fast = _unit_stride1(B)             # else pack element by element
         GC.@preserve Bpack B begin
             pBp = pointer(Bpack)
-            pB  = Ptr{$TR}(pointer(B))
-            ldB = stride(B, 2)              # in complex elements
+            pB  = fast ? Ptr{$TR}(pointer(B)) : Ptr{$TR}(C_NULL)
+            ldB = fast ? stride(B, 2) : 0   # in complex elements
             @inbounds for p in 0:npanels-1
                 cs   = p * $NR
                 cmax = min($NR, nc - cs)
                 base = p * 2 * $NR * kc
-                if cmax == $NR
+                if cmax == $NR && fast
                     for k in 0:kc-1
                         base_re = base + k * 2 * $NR
                         base_im = base_re + $NR
@@ -303,7 +305,7 @@ end
             push!(write_full, quote
                 let cre_v = $cre, cim_v = $cim
                     @inbounds for i in 0:$W-1
-                        c_off_b = 2 * $sz * ((ci + $roff + i - 1) + (cj + $(j-1) - 1) * ldc)
+                        c_off_b = 2 * $sz * ((ci + $roff + i - 1) * ldr + (cj + $(j-1) - 1) * ldc)
                         oldre = unsafe_load(pC + c_off_b)
                         oldim = unsafe_load(pC + c_off_b + $sz)
                         re    = cre_v[i+1]
@@ -326,7 +328,7 @@ end
                     let cre_v = $cre, cim_v = $cim
                         @inbounds for i in 0:$W-1
                             if $roff + i < mr_
-                                c_off_b = 2 * $sz * ((ci + $roff + i - 1) + (cj + $(j-1) - 1) * ldc)
+                                c_off_b = 2 * $sz * ((ci + $roff + i - 1) * ldr + (cj + $(j-1) - 1) * ldc)
                                 oldre = unsafe_load(pC + c_off_b)
                                 oldim = unsafe_load(pC + c_off_b + $sz)
                                 re    = cre_v[i+1]
@@ -352,6 +354,7 @@ end
                 $(inner...)
             end
 
+            ldr = stride(C, 1)              # any StridedMatrix, e.g. stepped views
             ldc = stride(C, 2)
             pC  = Ptr{$TR}(pointer(C))
             αre = real(α); αim = imag(α)

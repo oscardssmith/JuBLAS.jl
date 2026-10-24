@@ -3,6 +3,7 @@ using Libdl
 
 include("transpose_check.jl")
 include("test_libjublas.jl")
+include("strided_layouts.jl")
 
 Random.seed!(0)
 
